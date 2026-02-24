@@ -25,6 +25,10 @@ IO_EXTENT = 4096
 
 
 def _pointwise_interface_type(c):
+    """
+    Define interface type for top-level pointwise module.
+    Minimal interface includes only the input/output ports connected to IO instances.
+    """
     return c.Record({
         "hw_input_stencil_op_hcompute_hw_input_global_wrapper_stencil_read_0": c.Array(16, c.BitIn()),
         "hw_output_stencil_op_hcompute_hw_output_stencil_write_0": c.Array(16, c.Bit()),
