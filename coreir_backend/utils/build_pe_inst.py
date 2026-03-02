@@ -105,10 +105,42 @@ def pe_inst_to_bits_with_operands(
     # Build base instruction bits and family
     bv, fam = _base_inst_bitvector(op_name, repo_root)
 
-    # Disassemble to Inst so we can patch modes/consts
+    # Disassemble to Inst so we can patch modes/consts.
+    # Some rewrite rules (e.g., fp_mul) may set modes for unused registers to values not representable by Mode_t; sanitize those before decode.
     PE = lassen_fc(fam)
     inst_type = PE.input_t.field_dict["inst"]
     assembler = Assembler(inst_type)
+
+    # If the caller did not request data2/bit* sources, clamp their mode fields
+    # (regc/regd/rege/regf) to a valid Mode_t value (CONST=0) so that any
+    # rewrite-rule quirks on unused operands do not trigger decode errors.
+    sanitize_fields = []
+    if data2 is None:
+        sanitize_fields.append("regc")
+    if bit0 is None:
+        sanitize_fields.append("regd")
+    if bit1 is None:
+        sanitize_fields.append("rege")
+    if bit2 is None:
+        sanitize_fields.append("regf")
+
+    if sanitize_fields:
+        width = assembler.width
+        bv_int = int(bv)
+        for field in sanitize_fields:
+            if field not in assembler.layout:
+                continue
+            lo, hi = assembler.layout[field]
+            field_width = hi - lo
+            # Extract current encoded mode for this field.
+            field_val = (bv_int >> lo) & ((1 << field_width) - 1)
+            # Mode_t has valid opcodes {0, 2, 3}; if we see anything else,
+            # clamp the field to CONST (0).
+            if field_val not in (0, 2, 3):
+                mask = ((1 << field_width) - 1) << lo
+                bv_int &= ~mask
+        bv = fam.BitVector[width](bv_int)
+
     inst = assembler.disassemble(bv)
 
     def _patch_data(reg_field, data_field, src):

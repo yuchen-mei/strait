@@ -159,7 +159,7 @@ class CoreIRBackend:
         try:
             emit_func(kernel=kernel, output_path=layer_dir)
         except Exception as e:
-            print(f"[ERROR] Failed to emit json for {kernel_name}: {e}")
+            raise RuntimeError(f"[ERROR] Failed to emit json for {kernel_name}: {e}")
 
     def _get_kernel_design_meta_halide_json(self, kernel: Dict[str, Any]):
         """
