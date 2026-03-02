@@ -1,3 +1,7 @@
 .ast_tools
+.voyager-compiler-venv
 __pycache__
 */libs/*_header.json
+_generated_protobuf
+_generated_scheduled_ops
+_generated_coreirs

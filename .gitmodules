@@ -1,0 +1,4 @@
+[submodule "voyager-compiler"]
+	path = voyager-compiler
+	url = https://github.com/jeffreyyu0602/voyager-compiler.git
+	branch = main

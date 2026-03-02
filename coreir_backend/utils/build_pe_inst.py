@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import sys, os
 import json
+import struct
 from pathlib import Path
 
 from hwtypes import BitVector, Bit
@@ -24,7 +25,7 @@ def _default_for_type(t, fam):
     return fam.BitVector[16](0)
 
 
-def _base_inst_bitvector(op_name: str, repo_root: Path, fam=None):
+def _base_inst_bitvector(op_name: str, repo_root: Path = Path("/aha"), fam=None):
     """
     Get the base PE instruction as a BitVector, using the rewrite-rule mapping.
     This corresponds to the unconstrained single-PE op (all operands defaulted).
@@ -61,7 +62,16 @@ def _base_inst_bitvector(op_name: str, repo_root: Path, fam=None):
     return bv, fam
 
 
-def pe_inst_to_bits(op_name: str, repo_root: Path):
+def bf16_bits_from_float(x: float) -> int:
+    """
+    Return the 16-bit bfloat16 bit pattern for a Python float
+    """
+    packed = struct.pack("f", x)
+    u32 = struct.unpack("I", packed)[0]
+    return u32 >> 16
+
+
+def pe_inst_to_bits(op_name: str, repo_root: Path = Path("/aha")):
     '''
     Get 84-bit instruction for a single-PE op from its rewrite_rule json.
     This returns the "base" instruction with all operands using default
@@ -73,7 +83,7 @@ def pe_inst_to_bits(op_name: str, repo_root: Path):
 
 def pe_inst_to_bits_with_operands(
     op_name: str,
-    repo_root: Path,
+    repo_root: Path = Path("/aha"),
     *,
     data0=None,
     data1=None,
@@ -153,7 +163,7 @@ def main():
     hex_str = f"{width}'h{config_int:0{width // 4}x}"
     print(f"Instruction hex: {hex_str}")
 
-    # Test the instruction with operands
+    # Test the instruction with operands (integer mul)
     cfg, width = pe_inst_to_bits_with_operands(
         "mul",
         Path("/aha"),
@@ -163,6 +173,18 @@ def main():
     print(f"Op: mul with operands: data0=ext, data1=const(2)")
     print(f"Width: {width} bits")
     hex_str = f"{width}'h{cfg:0{width // 4}x}"
+    print(f"Instruction hex: {hex_str}")
+
+    # Example: fp_mul with bf16(2.0) constant
+    cfg_bf16, width = pe_inst_to_bits_with_operands(
+        "fp_mul",
+        Path("/aha"),
+        data0=("ext", None),
+        data1=("const", bf16_bits_from_float(2.0)),
+    )
+    print(f"Op: fp_mul with operands: data0=ext, data1=const(bf16(2.0))")
+    print(f"Width: {width} bits")
+    hex_str = f"{width}'h{cfg_bf16:0{width // 4}x}"
     print(f"Instruction hex: {hex_str}")
 
 
