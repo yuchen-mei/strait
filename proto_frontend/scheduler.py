@@ -1,15 +1,28 @@
 """
 Scheduler framework: load model protobuf, apply transformations
-(collapse_nops, fusion, tiling, fission), and generate new ops.
+(collapse_nops, decomposition, tiling, fusion), and generate new ops.
 Final output: json of transformed ops with operation, inputs and outputs.
+
+See scheduler_utils.py for bank allocation and JSON serialization helpers.
 """
+
 import argparse
-import json
 import os
-import re
 
 import strait.proto_frontend.param_pb2 as param_pb2
 from google.protobuf import text_format
+
+from strait.proto_frontend.scheduler_utils import (
+    _normalize_operation_name,
+    _num_banks,
+    _get_input_pairs,
+    _get_output_pairs,
+    _simple_op_to_json,
+    _stage_decomp_group_to_json,
+    _tensor_decomp_group_to_json,
+    _transpose_decomp_group_to_json,
+    _dumps_compact,
+)
 
 
 def load_model(model_protobuf_path: str) -> param_pb2.Model:
@@ -19,13 +32,12 @@ def load_model(model_protobuf_path: str) -> param_pb2.Model:
         text_format.Parse(f.read(), params)
     return params
 
+
 def collapse_nops(params: param_pb2.Model) -> None:
-    """
-    Assert no fused_op in the model, then remove all no-ops from params.ops.
-    """
-    for i, op in enumerate(params.ops):
+    """Assert no fused_op in the model, then remove all no-ops from params.ops."""
+    for op_idx, op in enumerate(params.ops):
         if op.WhichOneof("op_type") == "fused_op":
-            raise AssertionError(f"fused_op not supported: op at index {i} is a fused_op")
+            raise AssertionError(f"fused_op not supported: op at index {op_idx} is a fused_op")
 
     new_ops = []
     for op in params.ops:
@@ -38,123 +50,176 @@ def collapse_nops(params: param_pb2.Model) -> None:
     for op in new_ops:
         params.ops.add().CopyFrom(op)
 
-def fission(params: param_pb2.Model) -> None:
+
+# Per-op decomposition configuration: op_type -> (decomp_type, num_passes).
+# decomp_type: "tensor", "stage", or "transpose".
+# num_passes: for "tensor", must divide n_banks for every tensor dtype in the op
+#             (n_banks=8 for bfloat16, 4 for int8); for "stage", must be >= 2;
+#             for "transpose", use None to auto-derive (= n_banks // 2 from first input).
+_OP_DECOMP_CONFIG: dict = {
+    "silu": ("tensor", 2),
+    "transpose": ("transpose", None),
+}
+
+
+def _validate_decomp(op, decomp_type: str, num_passes: int) -> None:
+    """Raise ValueError if num_passes is invalid for the given decomp_type and op."""
+    if decomp_type == "stage":
+        if num_passes < 2:
+            raise ValueError(f"stage decomposition requires num_passes >= 2, got {num_passes}")
+    elif decomp_type == "tensor":
+        all_tensors = [t for _, t in _get_input_pairs(op)] + [t for _, t in _get_output_pairs(op)]
+        for tensor in all_tensors:
+            dtype = tensor.dtype or ""
+            if not dtype:
+                continue
+            bank_count = _num_banks(dtype)
+            if bank_count % num_passes != 0:
+                raise ValueError(
+                    f"tensor decomposition: num_passes={num_passes} does not evenly "
+                    f"divide n_banks={bank_count} (dtype={dtype}); valid values are factors of {bank_count}"
+                )
+    elif decomp_type == "transpose":
+        if num_passes < 1:
+            raise ValueError(f"transpose decomposition requires num_passes >= 1, got {num_passes}")
+    else:
+        raise ValueError(f"Unknown decomp_type: {decomp_type!r}")
+
+
+def decomposition(params: param_pb2.Model) -> dict:
     """
-    TODO: Implement fission
+    Decompose ops according to _OP_DECOMP_CONFIG.
+
+    Each matched op is replaced by num_passes copies named {original}_pass1 .. _passN.
+
+    decomp_type rules:
+      "tensor"   : bank count divided by num_passes per tensor; pass i uses the i-th
+                   sub-range of the original bank range.
+      "stage"    : bank count unchanged; each pass's output banks become the next
+                   pass's input banks.
+      "transpose": output banks unchanged; each pass's input graph banks = one even
+                   bank from the original input range (num_passes auto-derived as
+                   n_banks // 2 from the first input tensor dtype).
+
+    Returns pass_info: dict mapping op_name -> {pass_idx, total_passes, decomp_type, group_id}.
     """
+    pass_info = {}
+    new_ops = []
+    for op in params.ops:
+        op_type = _normalize_operation_name(op.op.target) or op.op.name
+        config = _OP_DECOMP_CONFIG.get(op_type)
+        if config is not None:
+            decomp_type, num_passes = config
+            if decomp_type == "transpose" and num_passes is None:
+                # Auto-derive: one pass per even unique bank = n_banks // 2.
+                first_dtype = next(
+                    (tensor.dtype for _, tensor in _get_input_pairs(op) if tensor.dtype),
+                    None,
+                )
+                if first_dtype is None:
+                    raise ValueError(f"transpose decomp: no input tensor with dtype found on op {op.op.name!r}")
+                num_passes = _num_banks(first_dtype) // 2
+            _validate_decomp(op, decomp_type, num_passes)
+            original_name = op.op.name
+            for pass_index in range(num_passes):
+                new_op = param_pb2.Operation()
+                new_op.CopyFrom(op)
+                new_op.op.name = f"{original_name}_pass{pass_index + 1}"
+                new_ops.append(new_op)
+                pass_info[new_op.op.name] = {
+                    "pass_idx": pass_index,
+                    "total_passes": num_passes,
+                    "decomp_type": decomp_type,
+                    "group_id": original_name,
+                }
+        else:
+            new_op = param_pb2.Operation()
+            new_op.CopyFrom(op)
+            new_ops.append(new_op)
+    params.ClearField("ops")
+    for op in new_ops:
+        params.ops.add().CopyFrom(op)
+    return pass_info
+
+
+def tiling(params: param_pb2.Model):
+    """TODO: Implement tiling"""
     pass
 
-def tiling(params: param_pb2.Model) -> None:
-    """
-    TODO: Implement tiling
-    """
+
+def fusion(params: param_pb2.Model):
+    """TODO: Implement fusion"""
     pass
 
-def fusion(params: param_pb2.Model) -> None:
-    """
-    TODO: Implement fusion
-    """
-    pass
 
-def schedule(params: param_pb2.Model) -> param_pb2.Model:
+def schedule(params: param_pb2.Model) -> dict:
     """
-    Run the full scheduler pipeline: collapse_nops -> fission -> tiling -> fusion.
-    Returns the transformed params (mutated in place).
+    Run the full scheduler pipeline: collapse_nops -> decomposition -> tiling -> fusion.
+    Mutates params in place and returns pass_info dict from decomposition.
     """
     collapse_nops(params)
-    fission(params)
+    pass_info = decomposition(params)
     tiling(params)
     fusion(params)
-    return params
+    return pass_info
 
-def get_schedule(params: param_pb2.Model):
+
+def params_to_json(params: param_pb2.Model, pass_info: dict = None) -> list:
     """
-    Return the list of op names in schedule order.
+    Convert scheduled params to a JSON list of ops.
+    Each op: {operation, name, inputs, outputs}.
+    Each tensor value: {node, shape, datatype, is_first_pass, is_last_pass,
+                        glb_bank_idx_for_data, glb_bank_idx_for_graph}.
+
+    Decomposed op groups are processed together so bank relationships between
+    passes (stage: shared banks; tensor: split banks) are correctly assigned.
     """
-    return [op.op.name for op in params.ops]
+    if pass_info is None:
+        pass_info = {}
 
-def _tensor_to_dict(tensor) -> dict:
-    """Convert a tensor protobuf to {node, shape, datatype} dict."""
-    return {
-        "node": tensor.node,
-        "shape": list(tensor.shape),
-        "datatype": tensor.dtype or "",
-    }
+    ops = list(params.ops)
+    result = []
+    op_idx = 0
+    while op_idx < len(ops):
+        op = ops[op_idx]
+        info = pass_info.get(op.op.name)
+        if info and info["pass_idx"] == 0:
+            # Collect all passes belonging to this decomposition group.
+            group_id = info["group_id"]
+            total_passes = info["total_passes"]
+            decomp_type = info["decomp_type"]
+            group = [op]
+            scan_idx = op_idx + 1
+            while scan_idx < len(ops) and len(group) < total_passes:
+                next_info = pass_info.get(ops[scan_idx].op.name)
+                if next_info and next_info["group_id"] == group_id:
+                    group.append(ops[scan_idx])
+                    scan_idx += 1
+                else:
+                    break
+            if decomp_type == "stage":
+                result.extend(_stage_decomp_group_to_json(group))
+            elif decomp_type == "tensor":
+                result.extend(_tensor_decomp_group_to_json(group))
+            elif decomp_type == "transpose":
+                result.extend(_transpose_decomp_group_to_json(group))
+            else:
+                raise ValueError(f"Unknown decomp_type: {decomp_type}")
+            op_idx = scan_idx
+        else:
+            result.append(_simple_op_to_json(op))
+            op_idx += 1
+    return result
 
-def _extract_tensors_from_argument(arg) -> list:
-    """Extract tensor dicts from an Argument (tensor or tensor_list)."""
-    which = arg.WhichOneof("arg_type")
-    if which == "tensor":
-        return [_tensor_to_dict(arg.tensor)]
-    if which == "tensor_list":
-        return [_tensor_to_dict(t) for t in arg.tensor_list.tensors]
-    return []
-
-def _extract_inputs_from_op_overload(op_overload) -> dict:
-    """Build inputs dict from OpOverload args and kwargs. Keys: arg index or kwarg name."""
-    inputs = {}
-    for i, arg in enumerate(op_overload.args):
-        tensors = _extract_tensors_from_argument(arg)
-        for j, t in enumerate(tensors):
-            key = str(i) if len(tensors) == 1 else f"{i}_{j}"
-            inputs[key] = t
-    for key, arg in op_overload.kwargs.items():
-        tensors = _extract_tensors_from_argument(arg)
-        for j, t in enumerate(tensors):
-            k = key if len(tensors) == 1 else f"{key}_{j}"
-            inputs[k] = t
-    return inputs
-
-def _extract_outputs_from_operation(op) -> dict:
-    """Build outputs dict from Operation output or outputs."""
-    which = op.WhichOneof("return_type")
-    if which == "output":
-        return {"0": _tensor_to_dict(op.output)}
-    if which == "outputs":
-        return {str(i): _tensor_to_dict(t) for i, t in enumerate(op.outputs.tensors)}
-    return {}
-
-def _normalize_operation_name(target: str) -> str:
-    """Extract op name (mul, add, softmax, etc.) from target string."""
-    if not target:
-        return "unknown"
-    # e.g. aten::mul.default -> mul; quantize_mx -> quantize_mx
-    m = re.search(r"::(\w+)(?:\.\w+)?$", target)
-    if m:
-        return m.group(1)
-    return target.split(".")[0] if "." in target else target
-
-def _operation_to_json(op) -> dict:
-    """Convert a single op to {operation, name, inputs, outputs} json dict."""
-    operation = _normalize_operation_name(op.op.target) or op.op.name
-    inputs = _extract_inputs_from_op_overload(op.op)
-    outputs = _extract_outputs_from_operation(op)
-    return {
-        "operation": operation,
-        "name": op.op.name,
-        "inputs": inputs,
-        "outputs": outputs,
-    }
-
-def params_to_json(params: param_pb2.Model) -> list:
-    """
-    Convert scheduled params to json list of transformed ops.
-    Each op: {operation, name, inputs and outputs}.
-    name: original op name from protobuf.
-    inputs/outputs: dict of name -> {node, shape, datatype}.
-    """
-    return [_operation_to_json(op) for op in params.ops]
 
 def protobuf_to_scheduled_ops(model_txt_path: str, output_json_path: str) -> None:
-    """
-    Load model.txt, schedule, write json of transformed ops.
-    """
+    """Load model.txt, schedule, write json of transformed ops."""
     params = load_model(model_txt_path)
-    schedule(params)
-    transformed_ops = params_to_json(params)
+    pass_info = schedule(params)
+    transformed_ops = params_to_json(params, pass_info)
     os.makedirs(os.path.dirname(output_json_path) or ".", exist_ok=True)
     with open(output_json_path, "w") as f:
-        json.dump(transformed_ops, f, indent=2)
+        f.write(_dumps_compact(transformed_ops))
     print(f"[INFO] Wrote {len(transformed_ops)} ops to {output_json_path}.")
 
 
@@ -165,7 +230,7 @@ def main():
     args = parser.parse_args()
 
     if not os.path.isfile(args.model_txt):
-        raise FileNotFoundError(f"Model file not found: {args.model_txt}")
+        raise FileNotFoundError(f"[ERROR] Model file not found: {args.model_txt}")
 
     protobuf_to_scheduled_ops(args.model_txt, args.output)
 
