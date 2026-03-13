@@ -76,11 +76,20 @@ class CoreIRBackend:
         Mapping each kernel to its corresponding CoreIR template name.
         """
         operation = kernel.get("operation")
+        first_input_dtype = next(iter(kernel.get("inputs", {}).values())).get("datatype")
 
+        if operation in ["silu", "gelu"]:
+            if first_input_dtype == "int8":
+                return "elementwise_swish_int8"
+            elif first_input_dtype == "bfloat16":
+                return "elementwise_swish_bf16"
+            else:
+                raise NotImplementedError(
+                    f"[TODO] No template mapping defined for operation: '{operation}' with datatype: '{first_input_dtype}'! "
+                    f"Please implement it in _get_template_name."
+                )
         # Add all elementwise operations here when needed.
-        if operation in ["mul", "add", "sub", "div", "reciprocal", "sqrt", "pow", "exp", "log"]:
-            # Check first input datatype
-            first_input_dtype = next(iter(kernel.get("inputs", {}).values())).get("datatype")
+        elif operation in ["mul", "add", "sub", "div", "reciprocal", "sqrt", "pow", "exp", "log"]:
             if first_input_dtype == "int8":
                 return f"elementwise_{operation}_int8"
             elif first_input_dtype == "bfloat16":
@@ -92,6 +101,26 @@ class CoreIRBackend:
                 )
         else:
             raise NotImplementedError(f"[TODO] No template mapping defined for operation: '{operation}'! Please implement it in _get_template_name.")
+
+    def _get_template_params(self, kernel: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Extract template parameters from a scheduled kernel entry.
+
+        - unroll: derived from the length of glb_bank_idx_for_graph on the first input.
+        - beta: operation-specific scale for swish-family ops (silu=1.0, gelu=1.702).
+        """
+        operation = kernel.get("operation")
+        params = {}
+
+        first_input = next(iter(kernel.get("inputs", {}).values()), {})
+        params["unroll"] = len(first_input.get("glb_bank_idx_for_graph", []))
+
+        if operation == "silu":
+            params["beta"] = 1.0
+        elif operation == "gelu":
+            params["beta"] = 1.702
+
+        return params
 
     def _get_kernel_tensor_files(self, kernel: Dict[str, Any]):
         """Convert tensor files from bin to raw and txt formats from proto_frontend to coreir_backend."""
@@ -129,8 +158,9 @@ class CoreIRBackend:
         kernel_name = kernel.get("name")
         operation = kernel.get("operation")
 
-        # Get template name from operation
+        # Get template name and parameters from operation
         template_name = self._get_template_name(kernel)
+        template_params = self._get_template_params(kernel)
 
         # Retrieve the emit function name from the template module
         emit_func_name = f"emit_{template_name}_coreir_json"
@@ -157,9 +187,16 @@ class CoreIRBackend:
         # Execute the template function
         # ===============================
         try:
-            emit_func(kernel=kernel, output_path=layer_dir)
+            emit_func(kernel=kernel, output_path=layer_dir, **template_params)
         except Exception as e:
             raise RuntimeError(f"[ERROR] Failed to emit json for {kernel_name}: {e}")
+
+        # Dump a per-kernel scheduled_ops.json so the IO placer can consume
+        # glb_bank_idx_for_graph without needing to know the frontend path.
+        sched_ops_path = os.path.join(layer_dir, "scheduled_ops.json")
+        with open(sched_ops_path, "w") as f:
+            json.dump([kernel], f, indent=2)
+        print(f"[INFO] Wrote per-kernel scheduled_ops.json to {sched_ops_path}")
 
     def _get_kernel_design_meta_halide_json(self, kernel: Dict[str, Any]):
         """

@@ -78,8 +78,19 @@ def _is_constant_div(node):
 MXU_OPS = ["conv2d", "linear", "matmul", "conv2d_mx", "linear_mx", "matmul_mx"]
 QUANT_OPS = ["quantize", "quantize_mx", "quantize_mx_outlier"]
 
-# Turn off fusion in voyager compiler and leave it to the strait scheduler.
-VECTOR_PIPELINE = []
+# Define fusible chain of nodes
+VECTOR_PIPELINE = [
+    # GEMM and dequantize
+    [
+        OpMatcher(*MXU_OPS, predicate=_can_fuse),
+        OpMatcher("dequantize"),
+    ],
+    # Elementwise activation
+    [
+        OpMatcher("gelu", "sigmoid", "silu", "tanh", "hardtanh"),
+        OpMatcher(*QUANT_OPS, "mul", "div"),
+    ],
+]
 
 
 def get_llama_qconfig(bs=64, outlier_pct=None):
@@ -117,6 +128,9 @@ def pointwise_mul_by_constant(input):
 def transpose2d(input):
     return input.transpose(-1, -2)
 
+def swish(input):
+    return torch.nn.functional.silu(input)
+
 unit_test_ops = {
     "pointwise":{
         "operation": pointwise_mul_by_constant,
@@ -126,6 +140,10 @@ unit_test_ops = {
         "operation": transpose2d,
         "input_shape": (128, 768),
     },
+    "swish": {
+        "operation": swish,
+        "input_shape": (128, 128),
+    }
 }
 
 
