@@ -22,6 +22,8 @@ from strait.proto_frontend.scheduler_utils import (
     _tensor_decomp_group_to_json,
     _transpose_decomp_group_to_json,
     _dumps_compact,
+    GLB_BANK_PER_TILE,
+    IOS_PER_TILE,
 )
 
 
@@ -55,7 +57,7 @@ def collapse_nops(params: param_pb2.Model) -> None:
 # decomp_type: "tensor", "stage", or "transpose".
 # num_passes: for "tensor", must divide n_banks for every tensor dtype in the op
 #             (n_banks=8 for bfloat16, 4 for int8); for "stage", must be >= 2;
-#             for "transpose", use None to auto-derive (= n_banks // 2 from first input).
+#             for "transpose", use None to auto-derive (= n_banks from first input).
 _OP_DECOMP_CONFIG: dict = {
     "silu": ("tensor", 2),
     "transpose": ("transpose", None),
@@ -111,14 +113,14 @@ def decomposition(params: param_pb2.Model) -> dict:
         if config is not None:
             decomp_type, num_passes = config
             if decomp_type == "transpose" and num_passes is None:
-                # Auto-derive: one pass per even unique bank = n_banks // 2.
+                # Auto-derive: one pass per GLB tile IO = n_banks // GLB_BANK_PER_TILE * IOS_PER_TILE.
                 first_dtype = next(
                     (tensor.dtype for _, tensor in _get_input_pairs(op) if tensor.dtype),
                     None,
                 )
                 if first_dtype is None:
                     raise ValueError(f"transpose decomp: no input tensor with dtype found on op {op.op.name!r}")
-                num_passes = _num_banks(first_dtype) // 2
+                num_passes = _num_banks(first_dtype) // GLB_BANK_PER_TILE * IOS_PER_TILE
             _validate_decomp(op, decomp_type, num_passes)
             original_name = op.op.name
             for pass_index in range(num_passes):

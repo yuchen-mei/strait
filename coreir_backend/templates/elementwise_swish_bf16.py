@@ -24,6 +24,7 @@ from strait.coreir_backend.utils.build_pe_inst import (
     bf16_bits_from_float,
     pe_inst_to_bits_with_operands,
 )
+from strait.coreir_backend.utils.coreir_helpers import make_mem_genargs
 
 HEADERS_DIR = list(headers_pkg.__path__)[0]
 
@@ -124,29 +125,12 @@ def _build_elementwise_swish_bf16_graph(unroll: int, input_name: str = "input", 
     exp_rom_list = []
     div_rom_list = []
 
-    rom_genargs = context.new_values(
-        {
-            "ID": "",
-            "ctrl_width": 16,
-            "has_chain_en": False,
-            "has_external_addrgen": False,
-            "has_flush": True,
-            "has_read_valid": False,
-            "has_reset": False,
-            "has_stencil_valid": True,
-            "has_valid": False,
-            "is_rom": True,
-            "num_inputs": 2,
-            "num_outputs": 2,
-            "use_prebuilt_mem": True,
-            "width": 16,
-        }
-    )
+    rom_genargs = make_mem_genargs(context)
     # Input buffer MEM: one write port (from IO), two read ports (to mul_a and mul_final).
     # Acts as a delay-matching FIFO in RV mode; RV schedule config added in _configure_.
     # The metadata overrides mode to 'lake' (UB mode) and sets is_rom=False so the backend
     # routes and configures it as a regular MEM.
-    input_buf_genargs = rom_genargs
+    input_buf_genargs = make_mem_genargs(context)
     exp_rom_table = _compute_exp_rom_table()
     div_rom_table = _compute_div_rom_table()
 

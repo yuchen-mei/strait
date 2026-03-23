@@ -219,12 +219,10 @@ def build_elementwise_mul_bf16_context(
 def emit_elementwise_mul_bf16_coreir_json(
     kernel: dict,
     output_path: str,
+    unroll: int = DEFAULT_UNROLL,
 ):
     kernel_inputs = kernel.get("inputs", {})
     assert len(kernel_inputs) == 2, "Elementwise mul BF16 kernel must have 2 inputs."
-
-    # TODO: Unroll should be dynamically determined based on resource constraints.
-    unroll = DEFAULT_UNROLL
     vector_len = None
     mul_const_val_bf16 = None
     # Determine the mode based on whether one of the inputs is a constant.

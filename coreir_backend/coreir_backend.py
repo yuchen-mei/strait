@@ -78,6 +78,7 @@ class CoreIRBackend:
         operation = kernel.get("operation")
         first_input_dtype = next(iter(kernel.get("inputs", {}).values())).get("datatype")
 
+        # Elementwise operations
         if operation in ["silu", "gelu"]:
             if first_input_dtype == "int8":
                 return "elementwise_swish_int8"
@@ -88,12 +89,23 @@ class CoreIRBackend:
                     f"[TODO] No template mapping defined for operation: '{operation}' with datatype: '{first_input_dtype}'! "
                     f"Please implement it in _get_template_name."
                 )
-        # Add all elementwise operations here when needed.
         elif operation in ["mul", "add", "sub", "div", "reciprocal", "sqrt", "pow", "exp", "log"]:
             if first_input_dtype == "int8":
                 return f"elementwise_{operation}_int8"
             elif first_input_dtype == "bfloat16":
                 return f"elementwise_{operation}_bf16"
+            else:
+                raise NotImplementedError(
+                    f"[TODO] No template mapping defined for operation: '{operation}' with datatype: '{first_input_dtype}'! "
+                    f"Please implement it in _get_template_name."
+                )
+
+        # Transpose
+        elif operation == "transpose":
+            if first_input_dtype == "bfloat16":
+                return "transpose_bf16"
+            elif first_input_dtype == "int8":
+                return "transpose_int8"
             else:
                 raise NotImplementedError(
                     f"[TODO] No template mapping defined for operation: '{operation}' with datatype: '{first_input_dtype}'! "
@@ -112,8 +124,17 @@ class CoreIRBackend:
         operation = kernel.get("operation")
         params = {}
 
-        first_input = next(iter(kernel.get("inputs", {}).values()), {})
-        params["unroll"] = len(first_input.get("glb_bank_idx_for_graph", []))
+        if operation == "transpose":
+            # For transpose, input graph banks hold one bank per pass.
+            # In Zircon, fabric can only load from odd banks in E64 MB mode, 
+            # and we actually only consume one software IO with 16-bit slice for each pass.
+            # Derive unroll from the output, which retains the full bank set.
+            first_output = next(iter(kernel.get("outputs", {}).values()), {})
+            params["unroll"] = len(first_output.get("glb_bank_idx_for_graph", []))
+            params["kernel_id"] = kernel.get("kernel_id", 0)
+        else:
+            first_input = next(iter(kernel.get("inputs", {}).values()), {})
+            params["unroll"] = len(first_input.get("glb_bank_idx_for_graph", []))
 
         if operation == "silu":
             params["beta"] = 1.0

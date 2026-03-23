@@ -8,6 +8,13 @@ import re
 SA_BANK_OFFSET = 12
 MAX_BANK_IDX = 27
 
+GLB_BANK_WIDTH = 64
+CGRA_WORD_WIDTH = 16
+GLB_BANK_PER_TILE = 2
+
+WORDS_PER_BANK = GLB_BANK_WIDTH // CGRA_WORD_WIDTH # = 4
+IOS_PER_TILE = GLB_BANK_PER_TILE * WORDS_PER_BANK  # = 8
+
 # ---------------------------------------------------------------------------
 # GLB Bank helpers
 # ---------------------------------------------------------------------------
@@ -113,6 +120,14 @@ def _allocate_sequential(pairs: list, start_bank: int) -> tuple:
 # ---------------------------------------------------------------------------
 
 
+def _e64_packing_for_graph(glb_for_graph: list) -> list:
+    """Return a list parallel to glb_for_graph: 1 if the bank appears exactly 4 times, else 0."""
+    counts = {}
+    for b in glb_for_graph:
+        counts[b] = counts.get(b, 0) + 1
+    return [1 if counts[b] == 4 else 0 for b in glb_for_graph]
+
+
 def _tensor_to_dict(tensor, is_first_pass, is_last_pass, glb_for_data, glb_for_graph) -> dict:
     return {
         "node": tensor.node,
@@ -122,6 +137,7 @@ def _tensor_to_dict(tensor, is_first_pass, is_last_pass, glb_for_data, glb_for_g
         "is_last_pass": is_last_pass,
         "glb_bank_idx_for_data": glb_for_data,
         "glb_bank_idx_for_graph": glb_for_graph,
+        "e64_packing_for_graph": _e64_packing_for_graph(glb_for_graph),
     }
 
 
@@ -242,12 +258,17 @@ def _transpose_decomp_group_to_json(group: list) -> list:
     """
     Generate JSON for a transpose-decomposed group.
 
-    Outputs: full original banks for both data and graph.
-    Inputs:  data = full original range; graph = [one_even_bank] per pass.
+    group has n_banks // GLB_BANK_PER_TILE * IOS_PER_TILE ops (e.g., 32 for bfloat16).
+    pass_idx encodes both tile and IO: tile_idx = pass_idx // IOS_PER_TILE,
+    io_idx = pass_idx % IOS_PER_TILE.
 
-    Example for bfloat16 starting at bank 12 (unique banks 12..19):
-      even banks = [12, 14, 16, 18]
-      pass0 graph=[12], pass1 graph=[14], pass2 graph=[16], pass3 graph=[18]
+    Outputs: full original banks for both data and graph.
+    Inputs:  data = full original range; graph = tile banks repeated WORDS_PER_BANK times.
+
+    Example for bfloat16 starting at bank 12 (32 passes total):
+      pass0..7  (tile0, banks 12,13): IO_idx_per_tile=0..7, graph=[12,12,12,12,13,13,13,13]
+      pass8..15 (tile1, banks 14,15): IO_idx_per_tile=0..7, graph=[14,14,14,14,15,15,15,15]
+      ...
     """
     total = len(group)
     first_op = group[0]
@@ -257,17 +278,22 @@ def _transpose_decomp_group_to_json(group: list) -> list:
     base_operation = _normalize_operation_name(first_op.op.target) or first_op.op.name
     result = []
     for pass_idx, op in enumerate(group):
-        is_first_pass, is_last_pass = (1 if pass_idx == 0 else 0), (1 if pass_idx == total - 1 else 0)
+        tile_idx = pass_idx // IOS_PER_TILE
+        is_first_pass = 1 if pass_idx == 0 else 0
+        is_last_pass = 1 if pass_idx == total - 1 else 0
 
         inputs = {}
         for (key, tensor), (_, _, orig_glb_banks) in zip(_get_input_pairs(op), orig_input_allocs):
-            even_banks = [b for b in orig_glb_banks[::4] if b % 2 == 0]
-            inputs[key] = _tensor_to_dict(tensor, is_first_pass, is_last_pass, orig_glb_banks, [even_banks[pass_idx]])
+            all_banks = orig_glb_banks[::4]
+            tile_banks = all_banks[tile_idx * GLB_BANK_PER_TILE : (tile_idx + 1) * GLB_BANK_PER_TILE]
+            tile_graph = [b for b in tile_banks for _ in range(WORDS_PER_BANK)]
+            inputs[key] = _tensor_to_dict(tensor, is_first_pass, is_last_pass, orig_glb_banks, tile_graph)
 
         result.append(
             {
                 "operation": base_operation,
                 "name": op.op.name,
+                "kernel_id": pass_idx,
                 "inputs": inputs,
                 "outputs": {
                     key: _tensor_to_dict(tensor, is_first_pass, is_last_pass, glb_banks, glb_banks)

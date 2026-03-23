@@ -841,8 +841,20 @@ if __name__ == "__main__":
         if args.bf16:
             model.bfloat16()
 
-        # Generate the correct input shape dynamically based on the op
-        example_args = (torch.randn(unit_test_ops[args.unit_test_op]["input_shape"], dtype=torch_dtype),)
+        # Generate the correct input shape dynamically based on the op.
+        # For bfloat16, build a tensor with unique, patterned bit patterns
+        # (0x3C00, 0x3C01, ...) so each element is distinguishable in hex dumps.
+        # 0x3C00 = 0.125 in bfloat16; incrementing the low bits stays in [0.125, 0.25).
+        input_shape = unit_test_ops[args.unit_test_op]["input_shape"]
+        if torch_dtype == torch.bfloat16:
+            n_elems = 1
+            for d in input_shape:
+                n_elems *= d
+            raw = (torch.arange(0x3C00, 0x3C00 + n_elems, dtype=torch.int32) % 0x7F80).to(torch.int16)
+            example_input = raw.view(torch.bfloat16).reshape(input_shape)
+        else:
+            example_input = torch.randn(input_shape, dtype=torch_dtype)
+        example_args = (example_input,)
 
         gm = prepare_pt2e(model, quantizer, example_args)
         gm.graph.print_tabular()

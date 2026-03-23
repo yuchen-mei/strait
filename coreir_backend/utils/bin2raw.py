@@ -38,7 +38,7 @@ def convert_bin_to_raw(input_path, output_path, target_dtype):
         print(f"[bin2raw] Converted {len(tensor_fp32)} fp32 values to {target_dtype} and saved to {output_path}")
 
     except Exception as e:
-        print(f"An error occurred during conversion: {e}")
+        raise RuntimeError(f"An error occurred during conversion: {e}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert an fp32 binary tensor to a byte-swapped .raw file.")
