@@ -145,6 +145,7 @@ class CoreIRBackend:
 
     def _get_kernel_tensor_files(self, kernel: Dict[str, Any]):
         """Convert tensor files from bin to raw and txt formats from proto_frontend to coreir_backend."""
+        import glob as _glob
         layer_dir = os.path.join(self.output_dir, kernel.get("name"))
         os.makedirs(layer_dir, exist_ok=True)
         kernel_inputs = kernel.get("inputs", {})
@@ -160,6 +161,17 @@ class CoreIRBackend:
                 input_path = os.path.join(self.tensor_files_path, input.get("node") + ".bin"),
                 output_path = os.path.join(layer_dir, "input_" + input.get("node") + ".txt"),
                 target_dtype = input.get("datatype")
+            )
+
+        # Tensor constants are filtered out of scheduled_ops inputs (no GLB bank allocation needed),
+        # but their raw files must still be staged so templates can read the constant values.
+        first_input_dtype = next(iter(kernel_inputs.values()), {}).get("datatype", "bfloat16")
+        for bin_path in _glob.glob(os.path.join(self.tensor_files_path, "*_tensor_constant*.bin")):
+            node_name = os.path.splitext(os.path.basename(bin_path))[0]
+            convert_bin_to_raw(
+                input_path=bin_path,
+                output_path=os.path.join(layer_dir, "input_" + node_name + ".raw"),
+                target_dtype=first_input_dtype,
             )
 
         for output_type, output in kernel_outputs.items():

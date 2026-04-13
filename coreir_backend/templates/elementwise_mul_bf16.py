@@ -222,10 +222,12 @@ def emit_elementwise_mul_bf16_coreir_json(
     unroll: int = DEFAULT_UNROLL,
 ):
     kernel_inputs = kernel.get("inputs", {})
-    assert len(kernel_inputs) == 2, "Elementwise mul BF16 kernel must have 2 inputs."
+    assert 1 <= len(kernel_inputs) <= 2, "Elementwise mul BF16 kernel must have 1 or 2 inputs."
     vector_len = None
     mul_const_val_bf16 = None
     # Determine the mode based on whether one of the inputs is a constant.
+    # Tensor constants may be absent from kernel_inputs (filtered out of scheduled_ops),
+    # in which case we fall back to scanning output_path for staged constant raw files.
     mode = "vector_x_vector"
     for input_type, input in kernel_inputs.items():
         node_name = input.get("node")
@@ -236,6 +238,14 @@ def emit_elementwise_mul_bf16_coreir_json(
             mul_const_val_bf16 = const_tensor_npy[0]
         else:
             vector_len = int(np.prod(input.get("shape")))
+
+    if mode == "vector_x_vector" and len(kernel_inputs) == 1:
+        # Constants were filtered out of scheduled_ops; look for staged constant raw files.
+        const_files = sorted(Path(output_path).glob("input_*_tensor_constant*.raw"))
+        if const_files:
+            mode = "vector_x_const"
+            const_tensor_npy = (np.fromfile(const_files[0], dtype=np.uint16).byteswap().astype(np.uint32) << 16).view(np.float32)
+            mul_const_val_bf16 = const_tensor_npy[0]
 
     context, elementwise_mul_bf16_top = build_elementwise_mul_bf16_context(unroll, vector_len, mode, mul_const_val_bf16)
     elementwise_mul_bf16_top.save_to_file(os.path.join(output_path, "design_top.json"))

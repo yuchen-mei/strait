@@ -138,7 +138,7 @@ unit_test_ops = {
     },
     "transpose2d": {
         "operation": transpose2d,
-        "input_shape": (128, 768),
+        "input_shape": (512, 64),
     },
     "swish": {
         "operation": swish,

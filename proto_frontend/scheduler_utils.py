@@ -79,15 +79,23 @@ def _raw_tensors_from_argument(arg) -> list:
 
 
 def _get_input_pairs(op) -> list:
-    """Return list of (key, tensor_proto) for all inputs of op."""
+    """Return list of (key, tensor_proto) for all non-constant inputs of op.
+
+    Tensor constants (_tensor_constant_*) are compile-time scalars that do not
+    need GLB bank allocations and must not appear in scheduled_ops.json.
+    """
     pairs = []
     for arg_idx, arg in enumerate(op.op.args):
         raw_tensors = _raw_tensors_from_argument(arg)
         for tensor_idx, tensor in enumerate(raw_tensors):
+            if "_tensor_constant" in tensor.node:
+                continue
             pairs.append((str(arg_idx) if len(raw_tensors) == 1 else f"{arg_idx}_{tensor_idx}", tensor))
     for kw_key, arg in op.op.kwargs.items():
         raw_tensors = _raw_tensors_from_argument(arg)
         for tensor_idx, tensor in enumerate(raw_tensors):
+            if "_tensor_constant" in tensor.node:
+                continue
             pairs.append((kw_key if len(raw_tensors) == 1 else f"{kw_key}_{tensor_idx}", tensor))
     return pairs
 
