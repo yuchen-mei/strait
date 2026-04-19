@@ -31,7 +31,11 @@ DEFAULT_VECTOR_LEN = 4096
 DEFAULT_MUL_CONST_VAL_BF16 = 2.0
 DEFAULT_MODE = "vector_x_const"
 
-_VALID_MODES = ("vector_x_const", "vector_x_vector", "mu_x_const")
+_VALID_MODES = ("vector_x_const", "vector_x_vector", "mu_x_const", "input_x_weight_broadcast")
+
+
+def _stencil_suffix(i: int) -> str:
+    return "" if i == 0 else f"_{i}"
 
 
 def _lane_port_names(mode: str, i: int):
@@ -40,6 +44,11 @@ def _lane_port_names(mode: str, i: int):
 
     - mu_x_const: Halide-style logical names so design_meta_halide.json alignment holds
       (mu_hw_input_stencil -> MU_ prefix via add_mu_prefix_to_io; hw_output_stencil).
+    - input_x_weight_broadcast: Halide-style names for
+      input_host_stencil * weight_host_stencil -> hw_output_stencil. The weight
+      tensor is a 1D vector broadcast across `num_vecs` rows (raw file holds only
+      the inner dim). Applicable whenever the app's weight stream matches this
+      broadcast-over-rows pattern.
     - vector_x_const / vector_x_vector: legacy generic names (input_stencil / input_B_stencil / output_stencil).
     """
     if mode == "mu_x_const":
@@ -48,6 +57,14 @@ def _lane_port_names(mode: str, i: int):
         input_a_self = f"{a}_clkwrk_{i}_op_hcompute_{a}_{i}_read_0"
         output_self = f"{o}_clkwrk_{i}_op_hcompute_{o}_{i}_write_0"
         return input_a_self, None, output_self, f"io16in_{input_a_self}", None, f"io16_{output_self}"
+
+    if mode == "input_x_weight_broadcast":
+        s = _stencil_suffix(i)
+        input_a_self = f"input_host_stencil_clkwrk_{i}_op_hcompute_input_glb_stencil{s}_read_0"
+        input_b_self = f"weight_host_stencil_clkwrk_{i}_op_hcompute_weight_glb_stencil{s}_read_0"
+        output_self = f"hw_output_stencil_clkwrk_{i}_op_hcompute_hw_output_stencil{s}_write_0"
+        return (input_a_self, input_b_self, output_self,
+                f"io16in_{input_a_self}", f"io16in_{input_b_self}", f"io16_{output_self}")
 
     input_a_self = f"lane_{i}_in"
     output_self = f"lane_{i}_out"
@@ -75,17 +92,18 @@ def _elementwise_mul_bf16_interface_type(context, unroll: int, mode: str):
     return context.Record(record)
 
 
-def _build_elementwise_mul_bf16_graph(unroll: int, mode: str):
+def _build_elementwise_mul_bf16_graph(unroll: int, mode: str, top_module: str = "elementwise_mul_bf16"):
     """
     Pure structural construction: create modules, instances, and connections
     for unroll lanes.
 
-    When mode is vector_x_vector, a second set of input IOs feeds pe.data1.
+    When mode is vector_x_vector or input_x_weight_broadcast, a second set of
+    input IOs feeds pe.data1.
 
     Returns (context, elementwise_mul_module, instances_dict).
     instances_dict has keys "io_in", "io_out", "pe", and optionally "io_in_B"
     """
-    has_second_input = mode == "vector_x_vector"
+    has_second_input = mode in ("vector_x_vector", "input_x_weight_broadcast")
 
     context = coreir.Context()
     for path in sorted(Path(HEADERS_DIR).glob("*.json")):
@@ -96,7 +114,7 @@ def _build_elementwise_mul_bf16_graph(unroll: int, mode: str):
     io_module = global_namespace.modules["IO"]
 
     elementwise_mul_bf16_module = global_namespace.new_module(
-        "elementwise_mul_bf16", _elementwise_mul_bf16_interface_type(context, unroll, mode)
+        top_module, _elementwise_mul_bf16_interface_type(context, unroll, mode)
     )
     elementwise_mul_bf16_definition = elementwise_mul_bf16_module.new_definition()
     elementwise_mul_bf16_interface = elementwise_mul_bf16_definition.interface
@@ -163,12 +181,21 @@ def _configure_elementwise_mul_bf16(
     vector_len: int,
     mode: str,
     mul_const_val_bf16: float,
+    num_vecs: int = None,
 ):
-    """Configuration step: PE instruction (vector x const, vector x vector, or mu x const) and IO metadata per lane."""
+    """
+    Configuration step: PE instruction (vector x const, vector x vector, or
+    mu x const) and IO metadata per lane.
+
+    For mode="input_x_weight_broadcast" the input_B (weight) uses a 2D
+    broadcast stream (weight raw file is only vec_length=vector_len/num_vecs
+    elements, reused across num_vecs rows). Caller must pass num_vecs for this
+    mode.
+    """
     if unroll <= 0 or vector_len % unroll != 0:
         raise ValueError(f"vector_len ({vector_len}) must be divisible by unroll ({unroll})")
     extent = vector_len // unroll
-    has_second_input = mode == "vector_x_vector"
+    has_second_input = mode in ("vector_x_vector", "input_x_weight_broadcast")
 
     io_in_list = instances["io_in"]
     io_out_list = instances["io_out"]
@@ -215,8 +242,26 @@ def _configure_elementwise_mul_bf16(
     for io_in in io_in_list:
         io_in.add_metadata("glb2out_0", glb2out)
     if has_second_input:
-        for io_in_B in instances["io_in_B"]:
-            io_in_B.add_metadata("glb2out_0", glb2out)
+        if mode == "input_x_weight_broadcast":
+            if num_vecs is None or num_vecs <= 0 or extent % num_vecs != 0:
+                raise ValueError(
+                    f"input_x_weight_broadcast mode requires num_vecs that divides "
+                    f"per-lane extent ({extent}); got num_vecs={num_vecs}"
+                )
+            per_row_extent = extent // num_vecs
+            weight_glb2out = json.dumps({
+                "cycle_starting_addr": [0],
+                "cycle_stride": [1, 1],
+                "dimensionality": 2,
+                "extent": [per_row_extent, num_vecs],
+                "read_data_starting_addr": [0],
+                "read_data_stride": [1, 1 - per_row_extent],
+            })
+            for io_in_B in instances["io_in_B"]:
+                io_in_B.add_metadata("glb2out_0", weight_glb2out)
+        else:
+            for io_in_B in instances["io_in_B"]:
+                io_in_B.add_metadata("glb2out_0", glb2out)
     for io_out in io_out_list:
         io_out.add_metadata("in2glb_0", in2glb)
 
@@ -226,6 +271,8 @@ def build_elementwise_mul_bf16_context(
     vector_len: int = DEFAULT_VECTOR_LEN,
     mode: str = DEFAULT_MODE,
     mul_const_val_bf16: float = DEFAULT_MUL_CONST_VAL_BF16,
+    num_vecs: int = None,
+    top_module: str = "elementwise_mul_bf16",
 ):
     """
     Build the elementwise_mul design with templated parameters.
@@ -233,8 +280,9 @@ def build_elementwise_mul_bf16_context(
     Args:
         unroll: Number of lanes (PEs and IO pairs).
         vector_len: Total vector size; each IO has extent vector_len // unroll.
-        mode: one of "vector_x_const", "vector_x_vector", "mu_x_const".
+        mode: one of "vector_x_const", "vector_x_vector", "mu_x_const", "input_x_weight_broadcast".
         mul_const_val_bf16: Constant operand for the multiply PE instruction (used when mode is vector_x_const or mu_x_const).
+        num_vecs: required for mode="input_x_weight_broadcast"; weight is broadcast across num_vecs rows.
 
     Returns:
         (context, elementwise_mul_module)
@@ -242,16 +290,24 @@ def build_elementwise_mul_bf16_context(
     if mode not in _VALID_MODES:
         raise ValueError(f"mode must be one of {_VALID_MODES}, got {mode!r}")
 
-    context, elementwise_mul_bf16_module, instances = _build_elementwise_mul_bf16_graph(unroll, mode)
+    context, elementwise_mul_bf16_module, instances = _build_elementwise_mul_bf16_graph(
+        unroll, mode, top_module=top_module,
+    )
     _configure_elementwise_mul_bf16(
-        context, instances, unroll, vector_len, mode, mul_const_val_bf16
+        context, instances, unroll, vector_len, mode, mul_const_val_bf16, num_vecs=num_vecs,
     )
     return context, elementwise_mul_bf16_module
 
 
-def emit_elementwise_mul_bf16_design(unroll: int, tensor_size: int, output_path: str, mode: str = DEFAULT_MODE, mul_const_val_bf16: float = DEFAULT_MUL_CONST_VAL_BF16):
+def emit_elementwise_mul_bf16_design(unroll: int, tensor_size: int, output_path: str,
+                                     mode: str = DEFAULT_MODE,
+                                     mul_const_val_bf16: float = DEFAULT_MUL_CONST_VAL_BF16,
+                                     num_vecs: int = None,
+                                     top_module: str = "elementwise_mul_bf16"):
     """Build and write the elementwise_mul_bf16 design_top.json. Thin wrapper for hack_design_top callers."""
-    context, mul_module = build_elementwise_mul_bf16_context(unroll, tensor_size, mode, mul_const_val_bf16)
+    context, mul_module = build_elementwise_mul_bf16_context(
+        unroll, tensor_size, mode, mul_const_val_bf16, num_vecs=num_vecs, top_module=top_module,
+    )
     out_file = os.path.join(output_path, "design_top.json")
     mul_module.save_to_file(out_file)
     print(f"[INFO] Wrote elementwise_mul_bf16 design_top.json to {out_file}")
