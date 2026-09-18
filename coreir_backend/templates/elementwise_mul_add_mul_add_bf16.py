@@ -1,30 +1,26 @@
 """
-Build the elementwise ((input * (1/gamma)) + (-beta/gamma)) * weight + bias
-CoreIR graph using pycoreir.
+Build the elementwise input * weight + bias CoreIR graph using pycoreir.
 
-Used by: layer_norm_pass3_fp — pass 3 of layer norm, which applies the affine
-rescale ((input - beta) * (1/gamma)) * weight + bias. Algebraically rewritten as
-(input * (1/gamma) + (-beta/gamma)) * weight + bias to give a straight 4-PE
-per-lane chain: mul_const -> add_const -> mul_vec -> add_vec.
+Used by: layer_norm_pass3_fp — pass 3 of layer norm, which applies the learned
+per-channel weight and bias to normalized input.
+The separate 16-lane affine pass also preserves GLB bank accessibility through
+the taped-out matrix-unit region's 16 horizontal switch-box tracks.
 
 Templated design parameters:
 - unroll: number of parallel lanes (= glb_i).
 - vec_length: inner vector length per row (= vec_width from halide args).
 - num_vecs: number of rows (= vec_height from halide args).
-- gamma: affine scale (default 1.2 from Halide hardcoded value).
-- beta: affine offset (default -0.35 from Halide hardcoded value).
+- buffer_outputs: decouple standalone GLB output lanes with MEM FIFOs;
+  fused LayerNorm supplies its own buffering and leaves this disabled.
 
 Per lane i:
-  input_host IO.out   -> mul_const_pe.data0  ; data1 = const(1/gamma)
-  mul_const_pe.O0     -> add_const_pe.data0  ; data1 = const(-beta/gamma)
-  add_const_pe.O0     -> mul_vec_pe.data0
+  input_host IO.out   -> mul_vec_pe.data0
   weight_host IO.out  -> mul_vec_pe.data1
   bias_host IO.out    -> add_vec_pe.data0
   mul_vec_pe.O0       -> add_vec_pe.data1
   add_vec_pe.O0       -> hw_output IO.in
 
-4 PEs per lane, 3 input IOs + 1 output IO per lane. Straight pipe, all lanes
-identical depth — no path balancing required.
+2 PEs per lane, 3 input IOs + 1 output IO per lane.
 """
 
 import json
@@ -36,23 +32,19 @@ from hwtypes import BitVector
 
 import strait.coreir_backend.utils.headers as headers_pkg
 from strait.coreir_backend.utils.build_pe_inst import (
-    bf16_bits_from_float,
     pe_inst_to_bits_with_operands,
 )
+from strait.coreir_backend.utils.coreir_helpers import make_mem_genargs
 
 HEADERS_DIR = list(headers_pkg.__path__)[0]
 
 DEFAULT_UNROLL = 16
 DEFAULT_VEC_LENGTH = 384
 DEFAULT_NUM_VECS = 128
-DEFAULT_GAMMA = 1.2
-DEFAULT_BETA = -0.35
 TOP_MODULE = "layer_norm_pass3_fp"
 
 _LANE_PE_ROLES = [
-    "mul_const",  # fp_mul(input, 1/gamma)
-    "add_const",  # fp_add(mul_const, -beta/gamma)
-    "mul_vec",    # fp_mul(add_const, weight)
+    "mul_vec",    # fp_mul(input, weight)
     "add_vec",    # fp_add(bias, mul_vec)
 ]
 
@@ -93,12 +85,8 @@ def _output_self_port(i: int) -> str:
     return f"hw_output_stencil_clkwrk_{i}_op_hcompute_hw_output_stencil{_stencil_suffix(i)}_write_0"
 
 
-def _compute_pe_instructions(gamma: float, beta: float):
-    inv_gamma_bf16 = bf16_bits_from_float(1.0 / gamma)
-    neg_beta_over_gamma_bf16 = bf16_bits_from_float(-beta / gamma)
+def _compute_pe_instructions():
     return {
-        "mul_const": pe_inst_to_bits_with_operands("fp_mul", data0=("ext", None), data1=("const", inv_gamma_bf16)),
-        "add_const": pe_inst_to_bits_with_operands("fp_add", data0=("ext", None), data1=("const", neg_beta_over_gamma_bf16)),
         "mul_vec": pe_inst_to_bits_with_operands("fp_mul", data0=("ext", None), data1=("ext", None)),
         "add_vec": pe_inst_to_bits_with_operands("fp_add", data0=("ext", None), data1=("ext", None)),
     }
@@ -114,7 +102,7 @@ def _interface_type(context, unroll: int):
     return context.Record(record)
 
 
-def _build_graph(unroll: int):
+def _build_graph(unroll: int, buffer_outputs: bool):
     if unroll < 1:
         raise ValueError(f"unroll must be >= 1, got {unroll}")
 
@@ -136,6 +124,14 @@ def _build_graph(unroll: int):
     bias_io_list = []
     output_io_list = []
     pe_by_role = {k: [] for k in _LANE_PE_ROLES}
+    output_fifos = []
+    if buffer_outputs:
+        mem_gen = context.get_lib("cgralib").generators["Mem"]
+        mem_genargs = make_mem_genargs(context)
+        clk = defn.add_module_instance(
+            "output_fifo_clk", context.get_namespace("corebit").modules["const"],
+            context.new_values({"value": True}),
+        )
 
     for i in range(unroll):
         input_io = defn.add_module_instance(_input_io_name(i), io_module, context.new_values({"mode": "in"}))
@@ -157,18 +153,30 @@ def _build_graph(unroll: int):
             lane_pes[role] = pe
             pe_by_role[role].append(pe)
 
-        # mul_const = input * (1/gamma)
-        defn.connect(input_io.select("out"), lane_pes["mul_const"].select("data0"))
-        # add_const = mul_const + (-beta/gamma)
-        defn.connect(lane_pes["mul_const"].select("O0"), lane_pes["add_const"].select("data0"))
-        # mul_vec = add_const * weight
-        defn.connect(lane_pes["add_const"].select("O0"), lane_pes["mul_vec"].select("data0"))
+        # mul_vec = input * weight
+        defn.connect(input_io.select("out"), lane_pes["mul_vec"].select("data0"))
         defn.connect(weight_io.select("out"), lane_pes["mul_vec"].select("data1"))
         # add_vec = bias + mul_vec  (Halide convention: data0=external add operand, data1=mul result)
         defn.connect(bias_io.select("out"), lane_pes["add_vec"].select("data0"))
         defn.connect(lane_pes["mul_vec"].select("O0"), lane_pes["add_vec"].select("data1"))
-        # add_vec -> output
-        defn.connect(lane_pes["add_vec"].select("O0"), output_io.select("in"))
+        # Standalone GLB streams need lane-skew buffering: deleting the old
+        # identity prefix alone costs 185 cycles in RTL (4191 -> 4376).
+        # Use SRAM FIFOs, not arithmetic padding. Fusion supplies its own
+        # buffering and leaves this option disabled.
+        result = lane_pes["add_vec"].select("O0")
+        if buffer_outputs:
+            fifo = defn.add_generator_instance(
+                f"output_fifo_lane_{i}", mem_gen, mem_genargs,
+                context.new_values({"config": {}, "mode": "lake"}),
+            )
+            for key, value in [("config", {}), ("is_rom", False),
+                               ("mode", "lake"), ("width", 16)]:
+                fifo.add_metadata(key, json.dumps(value))
+            defn.connect(clk.select("out"), fifo.select("clk_en"))
+            defn.connect(result, fifo.select("data_in_0"))
+            result = fifo.select("data_out_0")
+            output_fifos.append(fifo)
+        defn.connect(result, output_io.select("in"))
 
     top.definition = defn
     context.set_top(top)
@@ -179,18 +187,19 @@ def _build_graph(unroll: int):
         "bias_io": bias_io_list,
         "output_io": output_io_list,
         "pe": pe_by_role,
+        "output_fifos": output_fifos,
     }
     return context, top, instances
 
 
-def _configure(context, instances, unroll: int, vec_length: int, num_vecs: int, gamma: float, beta: float):
+def _configure(context, instances, unroll: int, vec_length: int, num_vecs: int):
     if vec_length % unroll != 0:
         raise ValueError(f"vec_length ({vec_length}) must be divisible by unroll ({unroll})")
 
     defn = instances["output_io"][0].module_def
     const_gen = context.get_lib("coreir").generators["const"]
 
-    pe_instrs = _compute_pe_instructions(gamma, beta)
+    pe_instrs = _compute_pe_instructions()
     for role, (inst_val, inst_width) in pe_instrs.items():
         for i, pe_inst in enumerate(instances["pe"][role]):
             c = defn.add_generator_instance(
@@ -203,6 +212,10 @@ def _configure(context, instances, unroll: int, vec_length: int, num_vecs: int, 
 
     per_lane_extent = num_vecs * vec_length // unroll
     per_row_extent = vec_length // unroll
+    for fifo in instances["output_fifos"]:
+        fifo.add_metadata("lake_rv_config", json.dumps({
+            "type": "fifo", "input_stream_size": per_lane_extent, "row_size": 8,
+        }))
 
     # Input is full [vec_length, num_vecs]: flat dim=1 stream of 3072 per lane.
     input_glb2out = json.dumps({
@@ -249,11 +262,10 @@ def build_elementwise_mul_add_mul_add_bf16_context(
     unroll: int = DEFAULT_UNROLL,
     vec_length: int = DEFAULT_VEC_LENGTH,
     num_vecs: int = DEFAULT_NUM_VECS,
-    gamma: float = DEFAULT_GAMMA,
-    beta: float = DEFAULT_BETA,
+    buffer_outputs: bool = False,
 ):
-    context, top, instances = _build_graph(unroll)
-    _configure(context, instances, unroll, vec_length, num_vecs, gamma, beta)
+    context, top, instances = _build_graph(unroll, buffer_outputs)
+    _configure(context, instances, unroll, vec_length, num_vecs)
     return context, top
 
 
@@ -262,10 +274,10 @@ def emit_elementwise_mul_add_mul_add_bf16_design(
     vec_length: int,
     num_vecs: int,
     output_path: str,
-    gamma: float = DEFAULT_GAMMA,
-    beta: float = DEFAULT_BETA,
+    buffer_outputs: bool = False,
 ):
-    context, top = build_elementwise_mul_add_mul_add_bf16_context(unroll, vec_length, num_vecs, gamma, beta)
+    context, top = build_elementwise_mul_add_mul_add_bf16_context(
+        unroll, vec_length, num_vecs, buffer_outputs=buffer_outputs)
     out_file = os.path.join(output_path, "design_top.json")
     top.save_to_file(out_file)
     print(f"[INFO] Wrote elementwise_mul_add_mul_add_bf16 design_top.json to {out_file}")
@@ -279,8 +291,6 @@ if __name__ == "__main__":
     parser.add_argument("--unroll", type=int, default=DEFAULT_UNROLL)
     parser.add_argument("--vec-length", type=int, default=DEFAULT_VEC_LENGTH)
     parser.add_argument("--num-vecs", type=int, default=DEFAULT_NUM_VECS)
-    parser.add_argument("--gamma", type=float, default=DEFAULT_GAMMA)
-    parser.add_argument("--beta", type=float, default=DEFAULT_BETA)
     parser.add_argument("--output-path", type=str, default=".")
     args = parser.parse_args()
-    emit_elementwise_mul_add_mul_add_bf16_design(args.unroll, args.vec_length, args.num_vecs, args.output_path, args.gamma, args.beta)
+    emit_elementwise_mul_add_mul_add_bf16_design(args.unroll, args.vec_length, args.num_vecs, args.output_path)

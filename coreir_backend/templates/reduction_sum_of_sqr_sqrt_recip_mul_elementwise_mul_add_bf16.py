@@ -1,14 +1,16 @@
 """
-Build the bf16 sum-of-squares + rsqrt + broadcast elementwise mul-add CoreIR
+Build the bf16 sum-of-squares + rsqrt + broadcast elementwise multiply CoreIR
 graph using pycoreir.
 
-Input is x - mean from pass1; output is (x - mean) * (sqrt(N) * gamma) / sqrt(sum_x((x-mean)^2)) + beta.
+For LayerNorm, input is x - mean from pass 1; for RMSNorm, input is x.
+Output is input * sqrt(N) / sqrt(sum(input^2)). Learned per-channel affine
+is applied by the following stage, never as scalar constants here.
 
 Per row:
     1. per-lane pre_square_pe: fp_mul(input, input) -> x^2
     2. balanced fp_add tree over unroll lanes + filter_mem + 2 accum ponds/PEs
        + final_reduce_pe                                  ->  sum_x(x^2)
-    3. scalar pipeline (sqrt(N)*gamma / sqrt(sum)):
+    3. scalar pipeline (sqrt(N) / sqrt(sum)):
          getmant_log + ln_rom                   ->  log(mantissa)
          cnvexp2f + scalar_mul_a(ln2)           ->  exponent * ln(2)
          scalar_fp_add                          ->  log(sum)
@@ -16,21 +18,16 @@ Per row:
          scalar_mul_c(const=1/ln2)              ->  0.5 * log2(sum) = log2(sqrt(sum))
          fp_getffrac + exp_rom + fp_getfint + addiexp
                                                 ->  sqrt(sum)
-         dummy_max_nop_pe (fp_max(x, -max)) for path balance between addiexp
-                                                    and subexp.data1
          getmant_div + div_rom + subexp         ->  1/sqrt(sum)
-         scalar_mul_d(const=sqrt(vec_width)*gamma)
-                                                ->  rstd = sqrt(N)*gamma / sqrt(sum)
+         scalar_mul_d(const=sqrt(vec_width))
+                                                ->  rstd = sqrt(N) / sqrt(sum)
     4. broadcast MEM holds the per-row rstd.
-    5. per-lane elementwise fp_mul(input, rstd) -> elementwise fp_add(..., const=beta)
-       -> output IO.
+    5. per-lane elementwise fp_mul(input, rstd) -> output IO.
 
 Parameters:
     unroll: glb_i (tree width / parallel lanes, must be power of 2).
-    vec_length: vec_width (row length; used for sqrt(vec_width)*gamma const).
+    vec_length: vec_width (row length; used for sqrt(vec_width) const).
     num_vecs: vec_height (number of rows per invocation).
-    gamma, beta: affine parameters. Defaults match the Halide hardcoded
-                 gamma=1.2, beta=-0.35.
 """
 
 import json
@@ -53,14 +50,7 @@ HEADERS_DIR = list(headers_pkg.__path__)[0]
 DEFAULT_UNROLL = 32
 DEFAULT_VEC_LENGTH = 768
 DEFAULT_NUM_VECS = 128
-DEFAULT_GAMMA = 1.2
-DEFAULT_BETA = -0.35
 DEFAULT_TOP_MODULE = "layer_norm_pass2_fp"
-DEFAULT_HAS_BETA = True
-
-# bf16 for largest-magnitude finite negative. Matches gold dummy_max_nop const;
-# avoids bf16 +/-inf which fp_max does not treat as a proper identity.
-_BF16_NEG_MAX = 0xFF7F
 
 
 def _stencil_suffix(i: int) -> str:
@@ -110,7 +100,7 @@ def _interface_type(context, unroll: int):
     return context.Record(record)
 
 
-def _build_graph(unroll: int, top_module: str = DEFAULT_TOP_MODULE, has_beta: bool = DEFAULT_HAS_BETA):
+def _build_graph(unroll: int, top_module: str = DEFAULT_TOP_MODULE):
     if unroll < 2 or (unroll & (unroll - 1)) != 0:
         raise ValueError(f"unroll must be a power of 2 and >= 2, got {unroll}")
 
@@ -143,8 +133,6 @@ def _build_graph(unroll: int, top_module: str = DEFAULT_TOP_MODULE, has_beta: bo
     tile_input_mem_list = []
     pre_square_pe_list = []
     elementwise_mul_pe_list = []
-    elementwise_add_pe_list = []
-    output_dummy_max_nop_pe_list = []
 
     for i in range(unroll):
         input_io = defn.add_module_instance(
@@ -176,12 +164,9 @@ def _build_graph(unroll: int, top_module: str = DEFAULT_TOP_MODULE, has_beta: bo
         pre_square_pe = defn.add_module_instance(f"pre_square_pe_{i}", pe_module)
         pre_square_pe_list.append(pre_square_pe)
 
-        # Per-lane elementwise: fp_mul(input, rstd) -> (optional) fp_add(..., beta_const).
+        # Normalize each lane; no scalar affine or output identity PE.
         ew_mul_pe = defn.add_module_instance(f"elementwise_mul_pe_{i}", pe_module)
         elementwise_mul_pe_list.append(ew_mul_pe)
-        if has_beta:
-            ew_add_pe = defn.add_module_instance(f"elementwise_add_pe_{i}", pe_module)
-            elementwise_add_pe_list.append(ew_add_pe)
 
         # input IO -> tile_input_mem.data_in_0
         defn.connect(input_io.select("out"), tile_input_mem.select("data_in_0"))
@@ -190,22 +175,10 @@ def _build_graph(unroll: int, top_module: str = DEFAULT_TOP_MODULE, has_beta: bo
         defn.connect(tile_input_mem.select("data_out_0"), pre_square_pe.select("data1"))
         # tile_input.data_out_1 -> elementwise_mul_pe.data0 (delayed for scaling)
         defn.connect(tile_input_mem.select("data_out_1"), ew_mul_pe.select("data0"))
-        if has_beta:
-            # ew_mul.O0 -> ew_add.data0 ; ew_add.O0 -> output IO
-            defn.connect(ew_mul_pe.select("O0"), ew_add_pe.select("data0"))
-            defn.connect(ew_add_pe.select("O0"), output_io.select("in"))
-        else:
-            # No beta: insert per-lane output_dummy_max_nop_pe between ew_mul.O0
-            # and output IO to match gold's timing padding. Named by lane index
-            # `i` (= output lane under identity topology); the remap aligns
-            # gold's counter-indexed dummies to these by tracing gold's dummy
-            # -> output_io connection.
-            out_dummy_pe = defn.add_module_instance(
-                f"{top_module}_output_dummy_max_nop_pe_{i}", pe_module
-            )
-            output_dummy_max_nop_pe_list.append(out_dummy_pe)
-            defn.connect(ew_mul_pe.select("O0"), out_dummy_pe.select("data0"))
-            defn.connect(out_dummy_pe.select("O0"), output_io.select("in"))
+        # Split-pass output Ponds absorb skew before coupled GLB transfers.
+        # Removing RMS output padding without rebalancing those Ponds stalls
+        # RTL after eight rows; path_balancing.json buffers these multipliers.
+        defn.connect(ew_mul_pe.select("O0"), output_io.select("in"))
 
     # Reduction tree: stage 1 consumes pre_square_pe.O0 from every lane.
     tree_stages = int(math.log2(unroll))
@@ -309,7 +282,6 @@ def _build_graph(unroll: int, top_module: str = DEFAULT_TOP_MODULE, has_beta: bo
     getffrac_pe = defn.add_module_instance(f"{top_module}_getffrac_pe", pe_module)
     getfint_pe = defn.add_module_instance(f"{top_module}_getfint_pe", pe_module)
     addiexp_pe = defn.add_module_instance(f"{top_module}_addiexp_pe", pe_module)
-    dummy_max_nop_pe = defn.add_module_instance(f"{top_module}_dummy_max_nop_pe", pe_module)
     getmant_div_pe = defn.add_module_instance(f"{top_module}_getmant_div_pe", pe_module)
     subexp_pe = defn.add_module_instance(f"{top_module}_subexp_pe", pe_module)
     scalar_mul_d_pe = defn.add_module_instance(f"{top_module}_scalar_mul_d_pe", pe_module)
@@ -364,7 +336,7 @@ def _build_graph(unroll: int, top_module: str = DEFAULT_TOP_MODULE, has_beta: bo
     ]:
         div_rom.add_metadata(_k, _v)
 
-    # Broadcast MEM (holds per-row rstd = sqrt(N)*gamma / sqrt(sum)).
+    # Broadcast MEM (holds per-row rstd = sqrt(N) / sqrt(sum)).
     broadcast_mem = defn.add_generator_instance(
         f"{top_module}_broadcast_mem",
         mem_gen, mem_genargs,
@@ -403,15 +375,14 @@ def _build_graph(unroll: int, top_module: str = DEFAULT_TOP_MODULE, has_beta: bo
     defn.connect(getfint_pe.select("O0"), addiexp_pe.select("data1"))
 
     # addiexp.O0 = sqrt(sum)
-    # Fan out to (a) dummy_max_nop -> subexp.data1, and (b) getmant_div -> div_rom -> subexp.data0.
-    defn.connect(addiexp_pe.select("O0"), dummy_max_nop_pe.select("data0"))
+    # Fan out to subexp.data1 and getmant_div -> div_rom -> subexp.data0.
+    defn.connect(addiexp_pe.select("O0"), subexp_pe.select("data1"))
     defn.connect(addiexp_pe.select("O0"), getmant_div_pe.select("data0"))
 
     defn.connect(getmant_div_pe.select("O0"), div_rom.select("addr_in_0"))
     defn.connect(div_rom.select("data_out_0"), subexp_pe.select("data0"))
-    defn.connect(dummy_max_nop_pe.select("O0"), subexp_pe.select("data1"))
 
-    # subexp.O0 = 1/sqrt(sum); scale by sqrt(N)*gamma; write to broadcast MEM.
+    # subexp.O0 = 1/sqrt(sum); scale by sqrt(N); write to broadcast MEM.
     defn.connect(subexp_pe.select("O0"), scalar_mul_d_pe.select("data0"))
     defn.connect(scalar_mul_d_pe.select("O0"), broadcast_mem.select("data_in_0"))
 
@@ -428,8 +399,6 @@ def _build_graph(unroll: int, top_module: str = DEFAULT_TOP_MODULE, has_beta: bo
         "tile_input_mem": tile_input_mem_list,
         "pre_square_pe": pre_square_pe_list,
         "elementwise_mul_pe": elementwise_mul_pe_list,
-        "elementwise_add_pe": elementwise_add_pe_list,
-        "output_dummy_max_nop_pe": output_dummy_max_nop_pe_list,
         "tree_pes_by_stage": tree_pes_by_stage,
         "filter_mem": filter_mem,
         "accum_pond_0": accum_pond_0,
@@ -446,7 +415,6 @@ def _build_graph(unroll: int, top_module: str = DEFAULT_TOP_MODULE, has_beta: bo
         "getffrac_pe": getffrac_pe,
         "getfint_pe": getfint_pe,
         "addiexp_pe": addiexp_pe,
-        "dummy_max_nop_pe": dummy_max_nop_pe,
         "getmant_div_pe": getmant_div_pe,
         "subexp_pe": subexp_pe,
         "scalar_mul_d_pe": scalar_mul_d_pe,
@@ -459,8 +427,7 @@ def _build_graph(unroll: int, top_module: str = DEFAULT_TOP_MODULE, has_beta: bo
 
 
 def _configure(context, instances, unroll: int, vec_length: int, num_vecs: int,
-               gamma: float, beta: float,
-               top_module: str = DEFAULT_TOP_MODULE, has_beta: bool = DEFAULT_HAS_BETA):
+               top_module: str = DEFAULT_TOP_MODULE):
     if vec_length % unroll != 0:
         raise ValueError(f"vec_length ({vec_length}) must be divisible by unroll ({unroll})")
     num_partial_reduction = vec_length // unroll
@@ -482,8 +449,7 @@ def _configure(context, instances, unroll: int, vec_length: int, num_vecs: int,
     ln2_bf16 = bf16_bits_from_float(math.log(2.0))
     half_bf16 = bf16_bits_from_float(0.5)
     inv_ln2_bf16 = bf16_bits_from_float(1.0 / math.log(2.0))
-    sqrt_n_gamma_bf16 = bf16_bits_from_float(math.sqrt(float(vec_length)) * gamma)
-    beta_bf16 = bf16_bits_from_float(beta)
+    sqrt_n_bf16 = bf16_bits_from_float(math.sqrt(float(vec_length)))
 
     scalar_mul_a_val, scalar_mul_a_w = pe_inst_to_bits_with_operands(
         "fp_mul", data0=("ext", None), data1=("const", ln2_bf16)
@@ -495,10 +461,7 @@ def _configure(context, instances, unroll: int, vec_length: int, num_vecs: int,
         "fp_mul", data0=("const", inv_ln2_bf16), data1=("ext", None)
     )
     scalar_mul_d_val, scalar_mul_d_w = pe_inst_to_bits_with_operands(
-        "fp_mul", data0=("ext", None), data1=("const", sqrt_n_gamma_bf16)
-    )
-    elementwise_add_val, elementwise_add_w = pe_inst_to_bits_with_operands(
-        "fp_add", data0=("ext", None), data1=("const", beta_bf16)
+        "fp_mul", data0=("ext", None), data1=("const", sqrt_n_bf16)
     )
     getmant_val, getmant_w = pe_inst_to_bits_with_operands(
         "fp_getmant", data0=("ext", None), data1=("const", 0)
@@ -517,9 +480,6 @@ def _configure(context, instances, unroll: int, vec_length: int, num_vecs: int,
     )
     subexp_val, subexp_w = pe_inst_to_bits_with_operands(
         "fp_subexp", data0=("ext", None), data1=("ext", None)
-    )
-    dummy_max_val, dummy_max_w = pe_inst_to_bits_with_operands(
-        "fp_max", data0=("ext", None), data1=("const", _BF16_NEG_MAX)
     )
 
     pe_inst_list = []
@@ -540,18 +500,11 @@ def _configure(context, instances, unroll: int, vec_length: int, num_vecs: int,
     pe_inst_list.append((instances["getffrac_pe"], f"{top_module}_getffrac_pe", getffrac_val, getffrac_w))
     pe_inst_list.append((instances["getfint_pe"], f"{top_module}_getfint_pe", getfint_val, getfint_w))
     pe_inst_list.append((instances["addiexp_pe"], f"{top_module}_addiexp_pe", addiexp_val, addiexp_w))
-    pe_inst_list.append((instances["dummy_max_nop_pe"], f"{top_module}_dummy_max_nop_pe", dummy_max_val, dummy_max_w))
     pe_inst_list.append((instances["getmant_div_pe"], f"{top_module}_getmant_div_pe", getmant_val, getmant_w))
     pe_inst_list.append((instances["subexp_pe"], f"{top_module}_subexp_pe", subexp_val, subexp_w))
     pe_inst_list.append((instances["scalar_mul_d_pe"], f"{top_module}_scalar_mul_d_pe", scalar_mul_d_val, scalar_mul_d_w))
     for i, pe in enumerate(instances["elementwise_mul_pe"]):
         pe_inst_list.append((pe, f"elementwise_mul_pe_{i}", fp_mul_val, fp_mul_w))
-    if has_beta:
-        for i, pe in enumerate(instances["elementwise_add_pe"]):
-            pe_inst_list.append((pe, f"elementwise_add_pe_{i}", elementwise_add_val, elementwise_add_w))
-    else:
-        for i, pe in enumerate(instances["output_dummy_max_nop_pe"]):
-            pe_inst_list.append((pe, f"{top_module}_output_dummy_max_nop_pe_{i}", dummy_max_val, dummy_max_w))
 
     for pe, name, inst_val, inst_w in pe_inst_list:
         c = defn.add_generator_instance(
@@ -583,9 +536,14 @@ def _configure(context, instances, unroll: int, vec_length: int, num_vecs: int,
     for io_out in instances["output_io"]:
         io_out.add_metadata("in2glb_0", in2glb)
 
+    # Use block counters for SRAM RAW/WAR guards instead of flat counters
+    # that wrap during long streams. Keep reduction demultiplexing blocks even.
+    block_size = (num_partial_reduction // 2 if num_partial_reduction % 4 == 0
+                  else num_partial_reduction)
     tile_input_cfg = json.dumps({
         "type": "dual_read",
         "input_stream_size": per_lane_extent,
+        "row_size": block_size,
     })
     for tim in instances["tile_input_mem"]:
         tim.add_metadata("lake_rv_config", tile_input_cfg)
@@ -593,6 +551,7 @@ def _configure(context, instances, unroll: int, vec_length: int, num_vecs: int,
     filter_cfg = json.dumps({
         "type": "get_filter_mem_two_streams",
         "input_stream_size": num_partial_reduction * num_vecs,
+        "row_size": block_size,
     })
     instances["filter_mem"].add_metadata("lake_rv_config", filter_cfg)
 
@@ -632,24 +591,20 @@ def build_reduction_sum_of_sqr_sqrt_recip_mul_elementwise_mul_add_bf16_context(
     unroll: int = DEFAULT_UNROLL,
     vec_length: int = DEFAULT_VEC_LENGTH,
     num_vecs: int = DEFAULT_NUM_VECS,
-    gamma: float = DEFAULT_GAMMA,
-    beta: float = DEFAULT_BETA,
     top_module: str = DEFAULT_TOP_MODULE,
-    has_beta: bool = DEFAULT_HAS_BETA,
 ):
-    context, top, instances = _build_graph(unroll, top_module=top_module, has_beta=has_beta)
-    _configure(context, instances, unroll, vec_length, num_vecs, gamma, beta,
-               top_module=top_module, has_beta=has_beta)
+    context, top, instances = _build_graph(unroll, top_module=top_module)
+    _configure(context, instances, unroll, vec_length, num_vecs,
+               top_module=top_module)
     return context, top
 
 
 def emit_reduction_sum_of_sqr_sqrt_recip_mul_elementwise_mul_add_bf16_design(
     unroll: int, vec_length: int, num_vecs: int, output_path: str,
-    gamma: float = DEFAULT_GAMMA, beta: float = DEFAULT_BETA,
-    top_module: str = DEFAULT_TOP_MODULE, has_beta: bool = DEFAULT_HAS_BETA,
+    top_module: str = DEFAULT_TOP_MODULE,
 ):
     context, top = build_reduction_sum_of_sqr_sqrt_recip_mul_elementwise_mul_add_bf16_context(
-        unroll, vec_length, num_vecs, gamma, beta, top_module=top_module, has_beta=has_beta,
+        unroll, vec_length, num_vecs, top_module=top_module,
     )
     out_file = os.path.join(output_path, "design_top.json")
     top.save_to_file(out_file)
@@ -665,14 +620,10 @@ if __name__ == "__main__":
     parser.add_argument("--unroll", type=int, default=DEFAULT_UNROLL)
     parser.add_argument("--vec-length", type=int, default=DEFAULT_VEC_LENGTH)
     parser.add_argument("--num-vecs", type=int, default=DEFAULT_NUM_VECS)
-    parser.add_argument("--gamma", type=float, default=DEFAULT_GAMMA)
-    parser.add_argument("--beta", type=float, default=DEFAULT_BETA)
     parser.add_argument("--top-module", type=str, default=DEFAULT_TOP_MODULE)
-    parser.add_argument("--no-beta", dest="has_beta", action="store_false", default=DEFAULT_HAS_BETA)
     parser.add_argument("--output-path", type=str, default=".")
     args = parser.parse_args()
     emit_reduction_sum_of_sqr_sqrt_recip_mul_elementwise_mul_add_bf16_design(
         args.unroll, args.vec_length, args.num_vecs, args.output_path,
-        gamma=args.gamma, beta=args.beta,
-        top_module=args.top_module, has_beta=args.has_beta,
+        top_module=args.top_module,
     )
