@@ -30,10 +30,9 @@ from .reduction_sum_of_sqr_sqrt_recip_mul_elementwise_mul_add_bf16 import (
 from .elementwise_mul_add_mul_add_bf16 import (
     emit_elementwise_mul_add_mul_add_bf16_design,
     _input_io_name,
-    _input_self_port,
     _output_io_name,
-    _output_self_port,
 )
+from .utils import configure_norm_io_layout, input_merge_config
 
 
 def emit_layer_norm_bf16_design(unroll, vec_length, num_vecs, output_path,
@@ -49,13 +48,8 @@ def emit_layer_norm_bf16_design(unroll, vec_length, num_vecs, output_path,
     if num_vecs < 1 or vec_length < 8 * unroll or vec_length % (8 * unroll):
         raise ValueError("Rows must be positive and width a positive multiple of 128")
     if input_unroll != unroll:
-        # Validate the configuration before constructing the graph. With four
-        # word write aggregators, each interleave block holds eight-word pairs.
-        from lake.spec.hack_rv_mem_pond_bitstream import get_merge_dual_read_mem
-        layout_block = max(8, vec_length // (2 * unroll))
-        if layout_block % 8:
-            layout_block = vec_length // unroll
-        get_merge_dual_read_mem(vec_length * num_vecs // input_unroll, layout_block)
+        merge_config = input_merge_config(unroll, vec_length, num_vecs, input_unroll)
+        layout_block = merge_config["row_size"]
 
     with TemporaryDirectory() as temporary:
         graphs, bypass = {}, {}
@@ -80,52 +74,9 @@ def emit_layer_norm_bf16_design(unroll, vec_length, num_vecs, output_path,
     result = copy.deepcopy(graphs["affine"])
     fused = module(result)
     instances, connections = fused["instances"], fused["connections"]
-    if input_unroll != unroll:
-        # Gamma and beta stay at 16 lanes; activation IO has its own width.
-        for lane in range(input_unroll):
-            name = _input_io_name(lane)
-            if lane >= unroll:
-                instances[name] = copy.deepcopy(instances[_input_io_name(0)])
-                fused["type"][1].append([_input_self_port(lane), ["Array", 16, "BitIn"]])
-                connections.append(["self." + _input_self_port(lane), name + ".in"])
-            instances[name]["metadata"]["glb2out_0"]["extent"] = [
-                vec_length * num_vecs // input_unroll]
-        # MEMs emit four low-half words followed by four high-half words.
-        # Within each eight-step group the logical indices are 0,2,4,6,1,3,5,7.
-        # DMA strides are rollover deltas (SKIP_GLB_DMA_STRIDE_ADJUSTMENT=1).
-        # Coefficients stay in their original GLB layout; no host repacking.
-        per_row = vec_length // unroll
-        for name, instance in instances.items():
-            if name.startswith(("io16in_weight_host_", "io16in_bias_host_")):
-                instance["metadata"]["glb2out_0"].update({
-                    "dimensionality": 4,
-                    "extent": [4, 2, per_row // 8, num_vecs],
-                    "cycle_stride": [1, 1, 1, 1],
-                    "read_data_stride": [2, -5, 1, 1 - per_row],
-                })
-            elif name.startswith("io16_hw_output_"):
-                instance["metadata"]["in2glb_0"].update({
-                    "dimensionality": 3,
-                    "extent": [4, 2, per_row * num_vecs // 8],
-                    "cycle_stride": [1, 1, 1],
-                    "write_data_stride": [2, -5, 1],
-                })
+    configure_norm_io_layout(fused, unroll, vec_length, num_vecs,
+                             input_unroll, output_unroll)
     scatter_outputs = output_unroll != unroll
-    if scatter_outputs:
-        # Each reader emits a canonical 32-lane stripe, so output DMA is
-        # sequential. All permutation stays inside the streaming MEMs.
-        for lane in range(output_unroll):
-            name = _output_io_name(lane)
-            if lane >= unroll:
-                instances[name] = copy.deepcopy(instances[_output_io_name(0)])
-                fused["type"][1].append([_output_self_port(lane), ["Array", 16, "Bit"]])
-                connections.append([name + ".out", "self." + _output_self_port(lane)])
-            instances[name]["metadata"]["in2glb_0"].update({
-                "dimensionality": 1,
-                "extent": [vec_length * num_vecs // output_unroll],
-                "cycle_stride": [1],
-                "write_data_stride": [1],
-            })
     # Replace the affine input edges with mean/normalization and FIFO stages.
     connections[:] = [edge for edge in connections
                        if not any(port.startswith("io16in_input_host_") for port in edge)
@@ -147,11 +98,7 @@ def emit_layer_norm_bf16_design(unroll, vec_length, num_vecs, output_path,
                 # without delaying each reduction by another complete row.
                 config["row_size"] = vec_length // (2 * unroll)
                 if stage == "mean" and name.startswith("tile_input_lane_") and input_unroll != unroll:
-                    config = {
-                        "type": "merge_dual_read",
-                        "single_input_stream_size": vec_length * num_vecs // input_unroll,
-                        "row_size": layout_block,
-                    }
+                    config = copy.deepcopy(merge_config)
                 elif name.endswith("_filter_mem") and input_unroll != unroll:
                     config["type"] = "deinterleave_blocks"
                     config["row_size"] = layout_block
