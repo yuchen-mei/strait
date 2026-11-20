@@ -33,16 +33,16 @@ Per lane (transposed FIR form):
       n = y * (-1/ln2); e = 2^n = exp(-y)           (fp_getffrac -> exp ROM, fp_getfint, fp_addiexp)
       d = e + 1; 1/d from the mantissa ROM         (fp_getmant -> div ROM, fp_subexp)
       out = y * (1/d)
-  y, n and d each feed a long branch directly and a short branch through a
-  FIFO, so no buffer sits on the critical path: y reaches the final multiply
-  through a MEM FIFO (that branch waits for the whole SiLU chain); n reaches
-  fp_getfint, and d reaches fp_subexp through a nop PE, through a Pond FIFO
-  (``get_fifo_pond``) in the tile of the reading PE. The Pond is written
-  through the interconnect: inside a tile, a PE output reaches the tile's
-  Pond without the fan-out handshake, so a Pond packed with the PE that
-  writes it stores a value again whenever the other reader stalls. A
-  register between the source and the Pond keeps the mapper from packing it
-  there.
+  y, n and d each feed two branches that meet again. y reaches the final
+  multiply through a MEM FIFO (that branch waits for the whole SiLU chain).
+  n and d are each written to a dual-read MEM, their only consumer; read
+  port 0 feeds the branch through the ROM and read port 1 the other branch,
+  and each port runs ahead as far as its branch allows. One branch of each
+  passes a ROM (a rigid lookup) and the other only a PE, so which branch is
+  longer depends on the placement; with a buffer at the fork the two branches
+  need not match, and no pass needs path-balancing Ponds. (An earlier version
+  put a Pond FIFO on the short branch; in one placement that branch was the
+  long one and its lane ran at 80%.)
 
 Weights and bias come from GLB once and are then replayed inside the tile.
 A channel's four weights are one 64-bit GLB word, so the four lanes of one
@@ -53,9 +53,9 @@ value in the Pond of its own tile (``get_repeat_pond``), which returns it
 once per position. Streaming the weights from GLB at every position instead
 ties the taps of two channels together through the GLB packet.
 
-Resources at unroll 8 with SiLU: 136 PEs, 40 MEMs (two x buffers, a y FIFO
-and two ROMs per lane), 56 Ponds (weights, bias and two FIFOs per lane),
-64 registers and 14 E64 IO tiles: 2 input, 8 weight, 2 bias, 2 output.
+Resources at unroll 8 with SiLU: 128 PEs, 56 MEMs (two x buffers, a y FIFO,
+two fork buffers and two ROMs per lane), 40 Ponds (weights and bias),
+48 registers and 14 E64 IO tiles: 2 input, 8 weight, 2 bias, 2 output.
 
 The SiLU exp ROM covers |y| up to about 88; larger magnitudes overflow the
 exponent arithmetic.
@@ -169,7 +169,6 @@ _SILU_OPS = {
     "silu_getfint": ("fp_getfint", ("ext",)),
     "silu_addiexp": ("fp_addiexp", ("ext", "ext")),
     "silu_add_one": ("fp_add", ("ext", 1.0)),
-    "silu_exp_nop": ("fp_max", ("ext", float("-inf"))),
     "silu_getmant": ("fp_getmant", ("ext",)),
     "silu_subexp": ("fp_subexp", ("ext", "ext")),
     "silu_mul_final": ("fp_mul", ("ext", "ext")),
@@ -207,7 +206,7 @@ def _build_graph(unroll: int, fuse_silu: bool):
         return inst
 
     instances = {"input_io": [], "weight_io": [], "bias_io": [], "output_io": [], "x_buffer": [], "y_fifo": [],
-                 "pond": [], "fifo_pond": [], "pe": {}}
+                 "fork_buffer": [], "pond": [], "pe": {}}
 
     def _add_pond(name):
         pond = defn.add_generator_instance(
@@ -228,22 +227,6 @@ def _build_graph(unroll: int, fuse_silu: bool):
         defn.connect(pond.select("data_out_pond_0"), pe_port)
         instances["pond"].append(pond)
 
-    def fifo_pond(name, src, pe_port):
-        """Elastic FIFO Pond in the tile of the PE that reads it (pe_port must be data0).
-
-        The Pond is written through the interconnect: a register between src and
-        the Pond keeps the mapper from packing it with the PE that drives src.
-        Inside a tile, a PE output reaches its Pond without the fan-out
-        handshake, so a Pond packed with the source PE would store a value
-        again whenever another reader of that output stalls.
-        """
-        pond = _add_pond(name)
-        reg = defn.add_generator_instance(f"{name}_in_reg", reg_gen, context.new_values({"width": 16}),
-                                          context.new_values({"clk_posedge": True, "init": BitVector[16](0)}))
-        defn.connect(src, reg.select("in"))
-        defn.connect(reg.select("out"), pond.select("data_in_pond_0"))
-        defn.connect(pond.select("data_out_pond_0"), pe_port)
-        instances["fifo_pond"].append(pond)
     ops = dict(_CONV_OPS, **(_SILU_OPS if fuse_silu else {}))
     for role in ops:
         instances["pe"][role] = []
@@ -301,27 +284,31 @@ def _build_graph(unroll: int, fuse_silu: bool):
             defn.connect(y, out_io.select("in"))
             continue
 
-        # y, n and d each feed a long branch directly and a short branch
-        # through an elastic FIFO: a MEM for y, whose short branch waits for
-        # the whole SiLU chain, and a Pond in the reading PE's tile for n and d.
+        # y feeds the final multiply through a MEM FIFO, whose branch waits
+        # for the whole SiLU chain. n and d each go to a dual-read MEM at the
+        # fork: port 0 feeds the branch through the ROM, port 1 the other one.
         y_fifo = _add_mem(defn, context, mem_gen, genargs, clk_en, f"y_fifo_lane{lane}")
         instances["y_fifo"].append(y_fifo)
+        n_buffer = _add_mem(defn, context, mem_gen, genargs, clk_en, f"n_buffer_lane{lane}")
+        d_buffer = _add_mem(defn, context, mem_gen, genargs, clk_en, f"d_buffer_lane{lane}")
+        instances["fork_buffer"] += [n_buffer, d_buffer]
         exp_rom = _add_mem(defn, context, mem_gen, genargs, clk_en, f"exp_rom_lane{lane}", exp_rom_table())
         div_rom = _add_mem(defn, context, mem_gen, genargs, clk_en, f"div_rom_lane{lane}", div_rom_table())
-        fifo_pond(f"n_fifo_pond_lane{lane}", pe["silu_neg_log2"].select("O0"), pe["silu_getfint"].select("data0"))
-        fifo_pond(f"d_fifo_pond_lane{lane}", pe["silu_add_one"].select("O0"), pe["silu_exp_nop"].select("data0"))
         wires = [
             (y, pe["silu_neg_log2"].select("data0")),
             (y, y_fifo.select("data_in_0")),
-            (pe["silu_neg_log2"].select("O0"), pe["silu_getffrac"].select("data0")),
+            (pe["silu_neg_log2"].select("O0"), n_buffer.select("data_in_0")),
+            (n_buffer.select("data_out_0"), pe["silu_getffrac"].select("data0")),
+            (n_buffer.select("data_out_1"), pe["silu_getfint"].select("data0")),
             (pe["silu_getffrac"].select("O0"), exp_rom.select("addr_in_0")),
             (exp_rom.select("data_out_0"), pe["silu_addiexp"].select("data0")),
             (pe["silu_getfint"].select("O0"), pe["silu_addiexp"].select("data1")),
             (pe["silu_addiexp"].select("O0"), pe["silu_add_one"].select("data0")),
-            (pe["silu_add_one"].select("O0"), pe["silu_getmant"].select("data0")),
+            (pe["silu_add_one"].select("O0"), d_buffer.select("data_in_0")),
+            (d_buffer.select("data_out_0"), pe["silu_getmant"].select("data0")),
             (pe["silu_getmant"].select("O0"), div_rom.select("addr_in_0")),
             (div_rom.select("data_out_0"), pe["silu_subexp"].select("data0")),
-            (pe["silu_exp_nop"].select("O0"), pe["silu_subexp"].select("data1")),
+            (d_buffer.select("data_out_1"), pe["silu_subexp"].select("data1")),
             (pe["silu_subexp"].select("O0"), pe["silu_mul_final"].select("data0")),
             (y_fifo.select("data_out_0"), pe["silu_mul_final"].select("data1")),
             (pe["silu_mul_final"].select("O0"), out_io.select("in")),
@@ -383,12 +370,10 @@ def _configure(context, instances, length: int):
     for io in instances["output_io"]:
         io.add_metadata("in2glb_0", stream("write", 1))
     block = _block_size_for(length)
-    for mem in instances["x_buffer"]:
+    for mem in instances["x_buffer"] + instances["fork_buffer"]:
         mem.add_metadata("lake_rv_config", json.dumps({"type": "dual_read", "input_stream_size": length, "row_size": block}))
     for mem in instances["y_fifo"]:
         mem.add_metadata("lake_rv_config", json.dumps({"type": "fifo", "input_stream_size": length, "row_size": block}))
-    for pond in instances["fifo_pond"]:
-        pond.add_metadata("lake_rv_config", json.dumps({"type": "get_fifo_pond", "input_stream_size": length, "read_port": 2}))
 
 
 def emit_depthwise_conv1d_silu_bf16_design(unroll: int, length: int, output_path: str, fuse_silu: bool = True):
