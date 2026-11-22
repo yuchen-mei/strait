@@ -85,8 +85,13 @@ def _shape(unroll: int, vec_length: int, num_vecs: int, scan_rows: int):
     mats = num_vecs // scan_rows
     if not 1 <= groups < POND_DEPTH - 2:
         raise ValueError(f"[ERROR] {groups} column groups per lane do not fit the 32-word Pond ring")
-    if not 2 <= groups * scan_rows <= MAX_EXTENT:
-        raise ValueError(f"[ERROR] {groups} groups x {scan_rows} rows exceed {MAX_EXTENT} tokens per matrix")
+    # The Pond counts a matrix of more than MAX_EXTENT tokens in chunks of up
+    # to MAX_EXTENT / 2 tokens (lake get_col_cumsum_pond).
+    tokens = groups * scan_rows
+    chunked = any(tokens % e == 0 and tokens // e <= MAX_EXTENT for e in range(MAX_EXTENT // 2, POND_DEPTH + groups, -1))
+    if tokens < 2 or (tokens > MAX_EXTENT and not chunked):
+        raise ValueError(f"[ERROR] {groups} groups x {scan_rows} rows: {tokens} tokens per matrix cannot be "
+                         f"split into chunks of at most {MAX_EXTENT // 2}")
     if not 2 <= mats <= MAX_EXTENT:
         raise ValueError(f"[ERROR] {mats} matrices must lie in [2, {MAX_EXTENT}]")
     return groups, mats
