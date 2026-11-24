@@ -22,6 +22,18 @@ Per lane i:
 
 5 PEs + 1 exp ROM per lane. No feedback, no pond; no MEM/Pond rv_config hack
 needed.
+
+Options (the defaults give stable_softmax_pass2_fp's design):
+- subtract=False: exp(input) alone (no vec_max IO; the input goes straight to
+  mul_b). Used by: mamba_exp_fp (Mamba2 exp_2 = exp(a_cum)).
+- clamp: a lower bound for z = diff * (1/ln2), one fp_max PE (clamp_pe) after
+  mul_b. fp_addiexp adds int(z) to the 8-bit exponent field mod 256, so z < -127
+  would wrap to a huge value; clamp=-127 makes those exactly 0.
+- rne=True: 1/ln2 and the ROM entries rounded to nearest even (bf16(1/ln2) =
+  1.4453; elementwise_broadcast_add_softplus_bf16's bf16_bits_rne and
+  exp_rom_table, the table masked_col_cumsum_exp_bf16 uses) instead of
+  truncated (1.4375).
+- top_module: the CoreIR top module name.
 """
 
 import json
@@ -94,26 +106,42 @@ def _compute_exp_rom_table():
     ]
 
 
-def _compute_pe_instructions():
-    ln2_inv_bf16 = bf16_bits_from_float(1.0 / math.log(2))
-    return {
+def _lane_pe_roles(subtract: bool = True, clamp=None):
+    roles = [r for r in _LANE_PE_ROLES if subtract or r != "sub"]
+    if clamp is not None:
+        roles.insert(roles.index("mul_b") + 1, "clamp")   # fp_max(z, clamp)
+    return roles
+
+
+def _compute_pe_instructions(subtract: bool = True, clamp=None, rne: bool = False):
+    if rne:
+        from strait.coreir_backend.templates.elementwise_broadcast_add_softplus_bf16 import bf16_bits_rne
+        ln2_inv_bf16 = bf16_bits_rne(1.0 / math.log(2))
+    else:
+        ln2_inv_bf16 = bf16_bits_from_float(1.0 / math.log(2))
+    insts = {
         "sub": pe_inst_to_bits_with_operands("fp_sub", data0=("ext", None), data1=("ext", None)),
         "mul_b": pe_inst_to_bits_with_operands("fp_mul", data0=("const", ln2_inv_bf16), data1=("ext", None)),
         "getffrac": pe_inst_to_bits_with_operands("fp_getffrac", data0=("ext", None)),
         "getfint": pe_inst_to_bits_with_operands("fp_getfint", data0=("ext", None)),
         "addiexp": pe_inst_to_bits_with_operands("fp_addiexp", data0=("ext", None), data1=("ext", None)),
     }
+    if clamp is not None:
+        from strait.coreir_backend.templates.elementwise_broadcast_add_softplus_bf16 import bf16_bits_rne
+        insts["clamp"] = pe_inst_to_bits_with_operands("fp_max", data0=("ext", None),
+                                                       data1=("const", bf16_bits_rne(clamp)))
+    return {role: insts[role] for role in _lane_pe_roles(subtract, clamp)}
 
 
-def _interface_type(context, unroll: int):
-    record = {_vec_max_self_port(): context.Array(16, context.BitIn())}
+def _interface_type(context, unroll: int, subtract: bool = True):
+    record = {_vec_max_self_port(): context.Array(16, context.BitIn())} if subtract else {}
     for i in range(unroll):
         record[_input_self_port(i)] = context.Array(16, context.BitIn())
         record[_output_self_port(i)] = context.Array(16, context.Bit())
     return context.Record(record)
 
 
-def _build_graph(unroll: int):
+def _build_graph(unroll: int, subtract: bool = True, clamp=None, rne: bool = False, top_module: str = TOP_MODULE):
     if unroll < 1:
         raise ValueError(f"unroll must be >= 1, got {unroll}")
 
@@ -127,21 +155,28 @@ def _build_graph(unroll: int):
     io_module = global_namespace.modules["IO"]
     mem_gen = context.get_lib("cgralib").generators["Mem"]
 
-    top = global_namespace.new_module(TOP_MODULE, _interface_type(context, unroll))
+    top = global_namespace.new_module(top_module, _interface_type(context, unroll, subtract))
     defn = top.new_definition()
     iface = defn.interface
 
     rom_genargs = make_mem_genargs(context)
-    exp_rom_table = _compute_exp_rom_table()
+    if rne:
+        from strait.coreir_backend.templates.elementwise_broadcast_add_softplus_bf16 import exp_rom_table as rne_table
+        exp_rom_table = rne_table()
+    else:
+        exp_rom_table = _compute_exp_rom_table()
+    roles = _lane_pe_roles(subtract, clamp)
 
-    vec_max_io = defn.add_module_instance(
-        _vec_max_io_name(), io_module, context.new_values({"mode": "in"})
-    )
-    defn.connect(iface.select(_vec_max_self_port()), vec_max_io.select("in"))
+    vec_max_io = None
+    if subtract:
+        vec_max_io = defn.add_module_instance(
+            _vec_max_io_name(), io_module, context.new_values({"mode": "in"})
+        )
+        defn.connect(iface.select(_vec_max_self_port()), vec_max_io.select("in"))
 
     input_io_list = []
     output_io_list = []
-    pe_by_role = {k: [] for k in _LANE_PE_ROLES}
+    pe_by_role = {k: [] for k in roles}
     exp_rom_list = []
 
     for i in range(unroll):
@@ -157,7 +192,7 @@ def _build_graph(unroll: int):
         output_io_list.append(output_io)
 
         lane_pes = {}
-        for role in _LANE_PE_ROLES:
+        for role in roles:
             pe = defn.add_module_instance(f"{role}_pe_{i}", pe_module)
             lane_pes[role] = pe
             pe_by_role[role].append(pe)
@@ -179,16 +214,25 @@ def _build_graph(unroll: int):
             exp_rom.add_metadata(_k, _v)
         exp_rom_list.append(exp_rom)
 
-        # sub_pe = input - vec_max
-        defn.connect(input_io.select("out"), lane_pes["sub"].select("data0"))
-        defn.connect(vec_max_io.select("out"), lane_pes["sub"].select("data1"))
+        if subtract:
+            # sub_pe = input - vec_max
+            defn.connect(input_io.select("out"), lane_pes["sub"].select("data0"))
+            defn.connect(vec_max_io.select("out"), lane_pes["sub"].select("data1"))
 
-        # diff * (1/ln2)  (1/ln2 baked as data0 const on mul_b)
-        defn.connect(lane_pes["sub"].select("O0"), lane_pes["mul_b"].select("data1"))
+            # diff * (1/ln2)  (1/ln2 baked as data0 const on mul_b)
+            defn.connect(lane_pes["sub"].select("O0"), lane_pes["mul_b"].select("data1"))
+        else:
+            defn.connect(input_io.select("out"), lane_pes["mul_b"].select("data1"))
+
+        z = lane_pes["mul_b"].select("O0")
+        if clamp is not None:
+            # z = max(z, clamp) (the clamp baked as data1 const)
+            defn.connect(z, lane_pes["clamp"].select("data0"))
+            z = lane_pes["clamp"].select("O0")
 
         # Split frac / int
-        defn.connect(lane_pes["mul_b"].select("O0"), lane_pes["getffrac"].select("data0"))
-        defn.connect(lane_pes["mul_b"].select("O0"), lane_pes["getfint"].select("data0"))
+        defn.connect(z, lane_pes["getffrac"].select("data0"))
+        defn.connect(z, lane_pes["getfint"].select("data0"))
 
         # ROM lookup on frac; addiexp reconstructs exp from mantissa + int
         defn.connect(lane_pes["getffrac"].select("O0"), exp_rom.select("addr_in_0"))
@@ -211,14 +255,15 @@ def _build_graph(unroll: int):
     return context, top, instances
 
 
-def _configure(context, instances, unroll: int, vec_length: int, num_vecs: int):
+def _configure(context, instances, unroll: int, vec_length: int, num_vecs: int, subtract: bool = True, clamp=None,
+               rne: bool = False):
     if vec_length % unroll != 0:
         raise ValueError(f"vec_length ({vec_length}) must be divisible by unroll ({unroll})")
 
     defn = instances["output_io"][0].module_def
     const_gen = context.get_lib("coreir").generators["const"]
 
-    pe_instrs = _compute_pe_instructions()
+    pe_instrs = _compute_pe_instructions(subtract, clamp, rne)
     for role, (inst_val, inst_width) in pe_instrs.items():
         for i, pe_inst in enumerate(instances["pe"][role]):
             c = defn.add_generator_instance(
@@ -260,7 +305,8 @@ def _configure(context, instances, unroll: int, vec_length: int, num_vecs: int):
 
     for io_in in instances["input_io"]:
         io_in.add_metadata("glb2out_0", input_glb2out)
-    instances["vec_max_io"].add_metadata("glb2out_0", vec_max_glb2out)
+    if subtract:
+        instances["vec_max_io"].add_metadata("glb2out_0", vec_max_glb2out)
     for io_out in instances["output_io"]:
         io_out.add_metadata("in2glb_0", output_in2glb)
 
@@ -269,9 +315,13 @@ def build_elementwise_sub_exp_bf16_context(
     unroll: int = DEFAULT_UNROLL,
     vec_length: int = DEFAULT_VEC_LENGTH,
     num_vecs: int = DEFAULT_NUM_VECS,
+    subtract: bool = True,
+    clamp=None,
+    rne: bool = False,
+    top_module: str = TOP_MODULE,
 ):
-    context, top, instances = _build_graph(unroll)
-    _configure(context, instances, unroll, vec_length, num_vecs)
+    context, top, instances = _build_graph(unroll, subtract, clamp, rne, top_module)
+    _configure(context, instances, unroll, vec_length, num_vecs, subtract, clamp, rne)
     return context, top
 
 
@@ -280,8 +330,13 @@ def emit_elementwise_sub_exp_bf16_design(
     vec_length: int,
     num_vecs: int,
     output_path: str,
+    subtract: bool = True,
+    clamp=None,
+    rne: bool = False,
+    top_module: str = TOP_MODULE,
 ):
-    context, top = build_elementwise_sub_exp_bf16_context(unroll, vec_length, num_vecs)
+    context, top = build_elementwise_sub_exp_bf16_context(unroll, vec_length, num_vecs, subtract, clamp, rne,
+                                                          top_module)
     out_file = os.path.join(output_path, "design_top.json")
     top.save_to_file(out_file)
     print(f"[INFO] Wrote elementwise_sub_exp_bf16 design_top.json to {out_file}")

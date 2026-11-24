@@ -2,6 +2,9 @@
 
     output[r, c] = softplus(input[r, c] + bias[r]),  softplus(s) = ln(1 + exp(s))
 
+With op="add" the kernel is the bias add alone, output[r, c] = input[r, c] + bias[r] (one fp_add per lane, same
+IOs, bias broadcast and streams; used as the carry add of a split-row cumsum).
+
 ``input`` is the [num_vecs, vec_length] activation. Each lane streams every
 ``unroll``-th value of a row, so a lane sees ``vec_length / unroll`` values of
 row 0, then of row 1, and so on. ``bias`` holds one value per row and is read
@@ -101,6 +104,11 @@ _PE_CHAIN = (
     ("relu", "fp_max", ("s:1", ("const", 0.0))),
     ("softplus", "fp_add", ("relu", "ln1p")),
 )
+# op="add": the bias add alone, out = input + bias[row] (e.g. the carry of a split-row cumsum). Same IOs, bias
+# broadcast and streams; no ROMs or fork buffers.
+_ADD_CHAIN = (("bias_add", "fp_add", ("in", "bias")),)
+_CHAINS = {"softplus": _PE_CHAIN, "add": _ADD_CHAIN}
+_OUTPUT_ROLE = {"softplus": "softplus", "add": "bias_add"}
 # ROM name -> PE whose output is the ROM address.
 _ROM_ADDRESS = {"exp": "getffrac", "ln": "low_byte"}
 # Fork buffer name -> PE whose output it holds.
@@ -186,7 +194,10 @@ def _add_rom(context, defn, name, table, mem_gen, genargs):
     return rom
 
 
-def _build_graph(unroll: int):
+def _build_graph(unroll: int, op: str = "softplus"):
+    if op not in _CHAINS:
+        raise ValueError(f"[ERROR] op must be one of {sorted(_CHAINS)}, got {op!r}")
+    chain = _CHAINS[op]
     context = coreir.Context()
     for path in sorted(Path(HEADERS_DIR).glob("*.json")):
         context.load_header(str(path))
@@ -213,7 +224,8 @@ def _build_graph(unroll: int):
         "input_io": [],
         "output_io": [],
         "fork_buffer": [],
-        "pe": {role: [] for role, _, _ in _PE_CHAIN},
+        "pe": {role: [] for role, _, _ in chain},
+        "chain": chain,
     }
 
     def fork_buffer(name):
@@ -260,10 +272,10 @@ def _build_graph(unroll: int):
         roms = {
             name: _add_rom(context, defn, f"{name}_rom_lane{i}", table, mem_gen, genargs)
             for name, table in tables.items()
-        }
+        } if op == "softplus" else {}
         sources = {"in": input_io.select("out"), "bias": bias_buffers[i // 2].select(f"data_out_{i % 2}")}
         forks = {}
-        for name in _FORK_SOURCE:
+        for name in (_FORK_SOURCE if op == "softplus" else {}):
             mem = fork_buffer(f"{name}_buffer_lane{i}")
             forks[name] = mem
             sources[f"{name}:0"] = mem.select("data_out_0")
@@ -271,7 +283,7 @@ def _build_graph(unroll: int):
         for name, rom in roms.items():
             sources[f"rom:{name}"] = rom.select("data_out_0")
         pes = {}
-        for role, _, operands in _PE_CHAIN:
+        for role, _, operands in chain:
             pe = defn.add_module_instance(f"{role}_pe_{i}", pe_module)
             for port, operand in zip(("data0", "data1", "data2"), operands):
                 if isinstance(operand, str):
@@ -282,9 +294,9 @@ def _build_graph(unroll: int):
 
         for name, rom in roms.items():
             defn.connect(sources[_ROM_ADDRESS[name]], rom.select("addr_in_0"))
-        for name, src in _FORK_SOURCE.items():
+        for name, src in (_FORK_SOURCE.items() if op == "softplus" else ()):
             defn.connect(sources[src], forks[name].select("data_in_0"))
-        defn.connect(sources["softplus"], output_io.select("in"))
+        defn.connect(sources[_OUTPUT_ROLE[op]], output_io.select("in"))
 
     top.definition = defn
     context.set_top(top)
@@ -325,7 +337,7 @@ def _configure(context, instances, unroll: int, vec_length: int, num_vecs: int):
 
     defn = instances["bias_io"].module_def
     const_gen = context.get_lib("coreir").generators["const"]
-    for role, op, operands in _PE_CHAIN:
+    for role, op, operands in instances["chain"]:
         inst_val, inst_w = _pe_instruction(op, operands)
         for pe in instances["pe"][role]:
             c = defn.add_generator_instance(
@@ -371,18 +383,19 @@ def build_elementwise_broadcast_add_softplus_bf16_context(
     unroll: int = DEFAULT_UNROLL,
     vec_length: int = DEFAULT_VEC_LENGTH,
     num_vecs: int = DEFAULT_NUM_VECS,
+    op: str = "softplus",
 ):
-    context, top, instances = _build_graph(unroll)
+    context, top, instances = _build_graph(unroll, op)
     _configure(context, instances, unroll, vec_length, num_vecs)
     return context, top
 
 
 def emit_elementwise_broadcast_add_softplus_bf16_design(
-    unroll: int, vec_length: int, num_vecs: int, output_path: str
+    unroll: int, vec_length: int, num_vecs: int, output_path: str, op: str = "softplus"
 ):
-    """Write design_top.json for one bias-add-softplus kernel into output_path."""
+    """Write design_top.json for one bias-add-softplus kernel (op="add": the bias add alone) into output_path."""
     context, top = build_elementwise_broadcast_add_softplus_bf16_context(
-        unroll, vec_length, num_vecs
+        unroll, vec_length, num_vecs, op
     )
     out_file = os.path.join(output_path, "design_top.json")
     top.save_to_file(out_file)
@@ -398,7 +411,8 @@ if __name__ == "__main__":
     parser.add_argument("--vec_length", type=int, default=DEFAULT_VEC_LENGTH)
     parser.add_argument("--num_vecs", type=int, default=DEFAULT_NUM_VECS)
     parser.add_argument("--output_path", type=str, default=".")
+    parser.add_argument("--op", type=str, default="softplus", choices=sorted(_CHAINS))
     args = parser.parse_args()
     emit_elementwise_broadcast_add_softplus_bf16_design(
-        args.unroll, args.vec_length, args.num_vecs, args.output_path
+        args.unroll, args.vec_length, args.num_vecs, args.output_path, args.op
     )

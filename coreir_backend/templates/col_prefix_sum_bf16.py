@@ -27,11 +27,20 @@ in the accumulator templates) to keep the loop short. The Pond's write side
 cannot stall its writer; read port 0 holds the PE back once the sums it would
 overwrite are unread, so a slow output stalls the loop instead of losing data.
 
+Column splits (optional): a matrix can be scanned as col_splits column slices
+of G = vec_length / (unroll * col_splits) groups each, which shortens each
+scan to G * scan_rows tokens (the Pond counts longer scans in chunks, so
+splits are not required). Columns are independent, so this is exact. The GLB keeps the whole row-major matrix: each
+lane reads and writes slice h of every row, rows 0 .. scan_rows - 1, before
+slice h + 1, through a 4-level address pattern (group, row, slice, matrix).
+The Pond treats every slice as its own matrix and is cleared between them.
+
 Templated design parameters:
 - unroll: lanes (32 for an activation in 4 GLB tiles).
-- vec_length: columns; a multiple of unroll.
+- vec_length: columns of the stored matrix; a multiple of unroll * col_splits.
 - num_vecs: rows of all matrices together (num_mats * scan_rows).
 - scan_rows: rows of one matrix (the scanned dimension).
+- col_splits: column slices scanned one after another (default 1, one slice).
 """
 
 import json
@@ -75,11 +84,11 @@ def _interface_type(context, unroll: int):
     return context.Record(record)
 
 
-def _shape(unroll: int, vec_length: int, num_vecs: int, scan_rows: int):
-    """Return (column groups per row, matrices) after checking the limits."""
-    if vec_length % unroll:
-        raise ValueError(f"[ERROR] vec_length {vec_length} must be a multiple of unroll {unroll}")
-    groups = vec_length // unroll
+def _shape(unroll: int, vec_length: int, num_vecs: int, scan_rows: int, col_splits: int = 1):
+    """Return (column groups per row slice, matrices) after checking the limits."""
+    if vec_length % (unroll * col_splits):
+        raise ValueError(f"[ERROR] vec_length {vec_length} must be a multiple of unroll {unroll} x col_splits {col_splits}")
+    groups = vec_length // (unroll * col_splits)
     if num_vecs % scan_rows:
         raise ValueError(f"[ERROR] num_vecs {num_vecs} must be a multiple of scan_rows {scan_rows}")
     mats = num_vecs // scan_rows
@@ -92,8 +101,8 @@ def _shape(unroll: int, vec_length: int, num_vecs: int, scan_rows: int):
     if tokens < 2 or (tokens > MAX_EXTENT and not chunked):
         raise ValueError(f"[ERROR] {groups} groups x {scan_rows} rows: {tokens} tokens per matrix cannot be "
                          f"split into chunks of at most {MAX_EXTENT // 2}")
-    if not 2 <= mats <= MAX_EXTENT:
-        raise ValueError(f"[ERROR] {mats} matrices must lie in [2, {MAX_EXTENT}]")
+    if not 2 <= mats * col_splits <= MAX_EXTENT:
+        raise ValueError(f"[ERROR] {mats} matrices x {col_splits} column slices must lie in [2, {MAX_EXTENT}]")
     return groups, mats
 
 
@@ -157,8 +166,8 @@ def _build_graph(unroll: int):
     return context, top, instances
 
 
-def _configure(context, instances, unroll: int, vec_length: int, num_vecs: int, scan_rows: int):
-    groups, mats = _shape(unroll, vec_length, num_vecs, scan_rows)
+def _configure(context, instances, unroll: int, vec_length: int, num_vecs: int, scan_rows: int, col_splits: int = 1):
+    groups, mats = _shape(unroll, vec_length, num_vecs, scan_rows, col_splits)
     defn = instances["output_io"][0].module_def
     const_gen = context.get_lib("coreir").generators["const"]
 
@@ -170,17 +179,32 @@ def _configure(context, instances, unroll: int, vec_length: int, num_vecs: int, 
         )
         defn.connect(c.select("out"), pe.select("inst"))
 
-    tokens = groups * num_vecs  # per lane
+    if col_splits == 1:
+        extents, strides = [groups * num_vecs], [1]  # per lane: the whole run in GLB order
+    else:
+        # Per lane, a row holds words = groups * col_splits GLB words. Loops, innermost first: the groups of slice h
+        # of one row, the rows, the slices, the matrices. Strides are steps from the last address (relative
+        # strides, SKIP_GLB_DMA_STRIDE_ADJUSTMENT): next row of the slice, back to row 0 of the next slice, then
+        # one past the matrix's last word. A loop of extent 1 is left out (the DMA encodes extent - 2).
+        words = groups * col_splits
+        loops = [
+            (groups, 1),
+            (scan_rows, words - groups + 1),
+            (col_splits, 1 - (scan_rows - 1) * words),
+            (mats, 1),
+        ]
+        extents = [e for e, _ in loops if e > 1]
+        strides = [st for e, st in loops if e > 1]
 
     def stream(key):
         return json.dumps(
             {
                 "cycle_starting_addr": [0],
-                "cycle_stride": [1],
-                "dimensionality": 1,
-                "extent": [tokens],
+                "cycle_stride": [1] * len(extents),
+                "dimensionality": len(extents),
+                "extent": extents,
                 f"{key}_data_starting_addr": [0],
-                f"{key}_data_stride": [1],
+                f"{key}_data_stride": strides,
             }
         )
 
@@ -189,7 +213,10 @@ def _configure(context, instances, unroll: int, vec_length: int, num_vecs: int, 
     for io in instances["output_io"]:
         io.add_metadata("in2glb_0", stream("write"))
 
-    pond_cfg = json.dumps({"type": "get_col_cumsum_pond", "num_groups": groups, "num_rows": scan_rows, "num_mats": mats})
+    # Each column slice of a matrix is its own matrix to the Pond (cleared before it)
+    pond_cfg = json.dumps(
+        {"type": "get_col_cumsum_pond", "num_groups": groups, "num_rows": scan_rows, "num_mats": mats * col_splits}
+    )
     for pond in instances["sum_pond"]:
         pond.add_metadata("lake_rv_config", pond_cfg)
 
@@ -201,10 +228,12 @@ def _write_pe_fifos_bypass_config(output_path: str, unroll: int):
         json.dump(cfg, f, indent=2)
 
 
-def emit_col_prefix_sum_bf16_design(unroll: int, vec_length: int, num_vecs: int, scan_rows: int, output_path: str):
+def emit_col_prefix_sum_bf16_design(
+    unroll: int, vec_length: int, num_vecs: int, scan_rows: int, output_path: str, col_splits: int = 1
+):
     """Write design_top.json and PE_fifos_bypass_config.json for one dim -2 cumsum kernel."""
     context, top, instances = _build_graph(unroll)
-    _configure(context, instances, unroll, vec_length, num_vecs, scan_rows)
+    _configure(context, instances, unroll, vec_length, num_vecs, scan_rows, col_splits)
     out_file = os.path.join(output_path, "design_top.json")
     top.save_to_file(out_file)
     print(f"[INFO] Wrote col_prefix_sum_bf16 design_top.json to {out_file}")
@@ -220,6 +249,9 @@ if __name__ == "__main__":
     parser.add_argument("--vec_length", type=int, default=DEFAULT_VEC_LENGTH)
     parser.add_argument("--num_vecs", type=int, default=DEFAULT_NUM_VECS)
     parser.add_argument("--scan_rows", type=int, default=DEFAULT_SCAN_ROWS)
+    parser.add_argument("--col_splits", type=int, default=1)
     parser.add_argument("--output_path", type=str, default=".")
     args = parser.parse_args()
-    emit_col_prefix_sum_bf16_design(args.unroll, args.vec_length, args.num_vecs, args.scan_rows, args.output_path)
+    emit_col_prefix_sum_bf16_design(
+        args.unroll, args.vec_length, args.num_vecs, args.scan_rows, args.output_path, args.col_splits
+    )
